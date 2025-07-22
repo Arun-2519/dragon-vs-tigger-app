@@ -6,19 +6,19 @@ from collections import defaultdict
 from io import BytesIO
 
 try:
-    from sklearn.naive_bayes import MultinomialNB
+    from xgboost import XGBClassifier
 except ModuleNotFoundError:
-    st.error("❌ Required module 'scikit-learn' not found. Please ensure it is listed in requirements.txt.")
+    st.error("❌ Required module 'xgboost' not found. Please ensure it is listed in requirements.txt.")
     st.stop()
 
 st.set_page_config(page_title="🐉⚖️🌟 Dragon Tiger AI", layout="centered")
-st.title("🐉 Dragon vs 🌟 Tiger Predictor (AI Powered)")
+st.title("🐉 Dragon vs 🌟 Tiger Predictor (AI Advanced)")
 
 st.markdown("""
     <style>
         body { background-color: #0f1117; color: #ffffff; }
         .stButton>button {
-            background-color: #9c27b0;
+            background-color: #6a1b9a;
             color: white;
             font-weight: bold;
         }
@@ -26,6 +26,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- Session State ---
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "username" not in st.session_state:
+    st.session_state.username = ""
 if "inputs" not in st.session_state:
     st.session_state.inputs = []
 if "X_train" not in st.session_state:
@@ -38,6 +42,28 @@ if "loss_streak" not in st.session_state:
     st.session_state.loss_streak = 0
 if "markov" not in st.session_state:
     st.session_state.markov = defaultdict(lambda: defaultdict(int))
+if "last_session" not in st.session_state:
+    st.session_state.last_session = None
+
+# --- Login ---
+def login(user, pwd): return pwd == "1234"
+if not st.session_state.authenticated:
+    st.subheader("🔐 Login")
+    u = st.text_input("Username")
+    p = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if login(u, p):
+            st.session_state.authenticated = True
+            st.session_state.username = u
+            st.success("✅ Logged in")
+        else:
+            st.error("❌ Invalid login")
+    st.stop()
+
+if st.button("Logout"):
+    st.session_state.authenticated = False
+    st.session_state.username = ""
+    st.rerun()
 
 # --- Encoding Helpers ---
 def encode(seq):
@@ -48,32 +74,24 @@ def decode(v):
     m = {0: 'D', 1: 'T', 2: 'TIE'}
     return m.get(v, "")
 
-# --- Prediction Logic ---
-def predict(seq):
+# --- Adaptive Pattern Clustering Prediction ---
+def xgb_predict(seq):
     if len(seq) < 10:
-        st.warning("🕐 Need at least 10 rounds to predict.")
         return None, 0
 
-    if len(st.session_state.X_train) < 20:
-        st.info(f"📊 Learning... only {len(st.session_state.X_train)} patterns learned. Need 20+.")
+    if len(st.session_state.X_train) < 30:
         return None, 0
 
-    encoded = encode(seq[-10:])
-    clf = MultinomialNB()
-    weights = np.exp(np.linspace(0, 1, len(st.session_state.X_train)))
-    clf.fit(st.session_state.X_train, st.session_state.y_train, sample_weight=weights)
-    pred = clf.predict([encoded])[0]
-    conf = max(clf.predict_proba([encoded])[0]) * 100
-    return decode(pred), round(conf)
+    model = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss')
+    X = np.array(st.session_state.X_train)
+    y = np.array(st.session_state.y_train)
+    model.fit(X, y)
+    pred = model.predict([encode(seq[-10:])])[0]
+    prob = model.predict_proba([encode(seq[-10:])])[0]
+    return decode(pred), round(max(prob) * 100)
 
-# --- Fallback ---
-def fallback(seq):
-    counts = {x: seq.count(x) for x in ['D', 'T', 'TIE']}
-    best = max(counts, key=counts.get)
-    return best, 55
-
-# --- Learning ---
-def learn(seq, actual):
+# --- Learn Pattern ---
+def learn_pattern(seq, actual):
     if len(seq) >= 10:
         st.session_state.X_train.append(encode(seq[-10:]))
         st.session_state.y_train.append(encode([actual])[0])
@@ -83,9 +101,9 @@ def learn(seq, actual):
             st.session_state.markov[key][actual] += 1
 
 # --- Input UI ---
-st.subheader("🎮 Add Result (D / T / TIE)")
+st.subheader("🎮 Add Round Result (D / T / TIE)")
 choice = st.selectbox("Choose Result", ["D", "T", "TIE"])
-if st.button("Add"):
+if st.button("➕ Add Result"):
     st.session_state.inputs.append(choice)
     st.success(f"Added: {choice}")
 
@@ -101,11 +119,9 @@ if len(st.session_state.inputs) > 10:
 
 # --- Prediction Section ---
 if len(st.session_state.inputs) >= 10:
-    pred, conf = predict(st.session_state.inputs)
+    pred, conf = xgb_predict(st.session_state.inputs)
 
-    # Debug info for training balance
-    labels = [decode(y) for y in st.session_state.y_train]
-    st.text(f"Training Balance ➡️ D: {labels.count('D')} | T: {labels.count('T')} | TIE: {labels.count('TIE')}")
+    st.text(f"Training Balance ➡️ D: {st.session_state.inputs.count('D')} | T: {st.session_state.inputs.count('T')} | TIE: {st.session_state.inputs.count('TIE')}")
 
     if pred is None or conf < 65:
         st.warning("⚠️ Not enough data or low confidence. Waiting for pattern...")
@@ -117,9 +133,10 @@ if len(st.session_state.inputs) >= 10:
 
         if st.session_state.loss_streak >= 3:
             st.warning("⚠️ Multiple wrong predictions. Be cautious!")
+            st.audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg", autoplay=True)
 
         actual = st.selectbox("Enter actual result", ["D", "T", "TIE"])
-        if st.button("Confirm & Learn"):
+        if st.button("✅ Confirm & Learn"):
             correct = actual == pred
             st.session_state.log.append({
                 "Prediction": pred,
@@ -127,26 +144,23 @@ if len(st.session_state.inputs) >= 10:
                 "Actual": actual,
                 "Correct": "✅" if correct else "❌"
             })
-            learn(st.session_state.inputs, actual)
+            learn_pattern(st.session_state.inputs, actual)
             st.session_state.inputs.append(actual)
-            if correct:
-                st.session_state.loss_streak = 0
-            else:
-                st.session_state.loss_streak += 1
+            st.session_state.loss_streak = 0 if correct else st.session_state.loss_streak + 1
             st.rerun()
 else:
     needed = 10 - len(st.session_state.inputs)
     st.info(f"Enter {needed} more inputs to begin prediction." if needed > 0 else "🧠 Learning from data...")
 
-# --- History ---
+# --- History & Export ---
 if st.session_state.log:
     st.subheader("📊 Prediction History")
     df = pd.DataFrame(st.session_state.log)
     st.dataframe(df)
-    if st.button("Download History"):
+    if st.button("📥 Generate Excel"):
         buf = BytesIO()
         df.to_excel(buf, index=False)
-        st.download_button("⬇️ Download Excel", data=buf.getvalue(), file_name="prediction_history.xlsx")
+        st.download_button("⬇️ Download Excel", data=buf.getvalue(), file_name=f"{st.session_state.username}_history.xlsx")
 
 st.markdown("---")
-st.caption("Built with ❤️ using Streamlit, Naive Bayes, and Pattern Learning")
+st.caption("Built with ❤️ using Streamlit, XGBoost, Pattern Clustering, and Auto-Learning")
