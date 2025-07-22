@@ -42,8 +42,8 @@ if "loss_streak" not in st.session_state:
     st.session_state.loss_streak = 0
 if "markov" not in st.session_state:
     st.session_state.markov = defaultdict(lambda: defaultdict(int))
-if "last_session" not in st.session_state:
-    st.session_state.last_session = None
+if "model" not in st.session_state:
+    st.session_state.model = None
 
 # --- Login ---
 def login(user, pwd): return pwd == "1234"
@@ -76,18 +76,21 @@ def decode(v):
 
 # --- Adaptive Pattern Clustering Prediction ---
 def xgb_predict(seq):
-    if len(seq) < 10:
+    if len(seq) < 10 or len(st.session_state.X_train) < 30:
         return None, 0
 
-    if len(st.session_state.X_train) < 30:
-        return None, 0
+    if st.session_state.model is None:
+        model = XGBClassifier(eval_metric='mlogloss')
+        X = np.array(st.session_state.X_train)
+        y = np.array(st.session_state.y_train)
+        model.fit(X, y)
+        st.session_state.model = model
+    else:
+        model = st.session_state.model
 
-    model = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss')
-    X = np.array(st.session_state.X_train)
-    y = np.array(st.session_state.y_train)
-    model.fit(X, y)
-    pred = model.predict([encode(seq[-10:])])[0]
-    prob = model.predict_proba([encode(seq[-10:])])[0]
+    X_input = np.array([encode(seq[-10:])])
+    pred = model.predict(X_input)[0]
+    prob = model.predict_proba(X_input)[0]
     return decode(pred), round(max(prob) * 100)
 
 # --- Learn Pattern ---
@@ -95,6 +98,7 @@ def learn_pattern(seq, actual):
     if len(seq) >= 10:
         st.session_state.X_train.append(encode(seq[-10:]))
         st.session_state.y_train.append(encode([actual])[0])
+        st.session_state.model = None  # Invalidate cache
     for l in range(10, 4, -1):
         if len(seq) >= l:
             key = tuple(seq[-l:])
