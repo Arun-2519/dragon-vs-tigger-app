@@ -50,7 +50,12 @@ def decode(v):
 
 # --- Prediction Logic ---
 def predict(seq):
-    if len(seq) < 10 or len(st.session_state.X_train) < 20:
+    if len(seq) < 10:
+        st.warning("🕐 Need at least 10 rounds to predict.")
+        return None, 0
+
+    if len(st.session_state.X_train) < 20:
+        st.info(f"📊 Learning... only {len(st.session_state.X_train)} patterns learned. Need 20+.")
         return None, 0
 
     encoded = encode(seq[-10:])
@@ -87,6 +92,10 @@ if st.button("Add"):
 # --- Prediction Section ---
 if len(st.session_state.inputs) >= 10:
     pred, conf = predict(st.session_state.inputs)
+
+    # Debug info for training balance
+    labels = [decode(y) for y in st.session_state.y_train]
+    st.text(f"Training Balance ➡️ D: {labels.count('D')} | T: {labels.count('T')} | TIE: {labels.count('TIE')}")
 
     if pred is None or conf < 65:
         st.warning("⚠️ Not enough data or low confidence. Waiting for pattern...")
