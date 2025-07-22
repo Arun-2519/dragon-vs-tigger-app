@@ -1,5 +1,6 @@
-streamlit
+streamlit==1.47.0
 pandas
 numpy
-xgboost
-openpyxl
+tensorflow
+sqlite3  # ← optional: built-in with Python, so remove if error occurs
+openpyxl  # for Excel export
