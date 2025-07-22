@@ -44,6 +44,10 @@ if "markov" not in st.session_state:
     st.session_state.markov = defaultdict(lambda: defaultdict(int))
 if "model" not in st.session_state:
     st.session_state.model = None
+if "initialized" not in st.session_state:
+    st.session_state.X_train = []
+    st.session_state.y_train = []
+    st.session_state.initialized = True
 
 # --- Login ---
 def login(user, pwd): return pwd == "1234"
@@ -79,10 +83,15 @@ def xgb_predict(seq):
     if len(seq) < 10 or len(st.session_state.X_train) < 30:
         return None, 0
 
+    X = np.array(st.session_state.X_train)
+    y = np.array(st.session_state.y_train)
+
+    if len(X) != len(y) or len(X) == 0:
+        st.warning("⚠️ Mismatch or empty training data. Skipping model training.")
+        return None, 0
+
     if st.session_state.model is None:
         model = XGBClassifier(eval_metric='mlogloss')
-        X = np.array(st.session_state.X_train)
-        y = np.array(st.session_state.y_train)
         model.fit(X, y)
         st.session_state.model = model
     else:
