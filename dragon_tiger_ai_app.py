@@ -89,6 +89,16 @@ if st.button("Add"):
     st.session_state.inputs.append(choice)
     st.success(f"Added: {choice}")
 
+# --- Continuous Learning ---
+if len(st.session_state.inputs) > 10:
+    for i in range(10, len(st.session_state.inputs)):
+        history_slice = st.session_state.inputs[i-10:i]
+        result = st.session_state.inputs[i]
+        encoded_seq = encode(history_slice)
+        if len(encoded_seq) == 10:
+            st.session_state.X_train.append(encoded_seq)
+            st.session_state.y_train.append(encode([result])[0])
+
 # --- Prediction Section ---
 if len(st.session_state.inputs) >= 10:
     pred, conf = predict(st.session_state.inputs)
@@ -125,7 +135,8 @@ if len(st.session_state.inputs) >= 10:
                 st.session_state.loss_streak += 1
             st.rerun()
 else:
-    st.info(f"Enter {10 - len(st.session_state.inputs)} more inputs to begin prediction.")
+    needed = 10 - len(st.session_state.inputs)
+    st.info(f"Enter {needed} more inputs to begin prediction." if needed > 0 else "🧠 Learning from data...")
 
 # --- History ---
 if st.session_state.log:
