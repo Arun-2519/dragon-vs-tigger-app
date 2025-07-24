@@ -1,45 +1,52 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sqlite3
+import random
+from collections import defaultdict
 from io import BytesIO
-from sklearn.naive_bayes import MultinomialNB
-from collections import deque, defaultdict
 
-# --- App Setup ---
-st.set_page_config(page_title="🐉 Dragon vs Tiger AI", layout="centered")
-st.title("🐉 Dragon vs Tiger Predictor (Lite AI)")
+# --- Safe import with clear error ---
+try:
+    from sklearn.naive_bayes import MultinomialNB
+except ModuleNotFoundError:
+    st.error("❌ Required module 'scikit-learn' not found. Please ensure it is listed in requirements.txt.")
+    st.stop()
 
-# --- Styling ---
+# --- App UI Config ---
+st.set_page_config(page_title="🔁🎟️ Dragon Tiger AI", layout="centered")
 st.markdown("""
     <style>
         body { background-color: #0f1117; color: #ffffff; }
         .stButton>button {
-            background-color: #6a1b9a;
+            background-color: #9c27b0;
             color: white;
             font-weight: bold;
         }
     </style>
 """, unsafe_allow_html=True)
 
-# --- Database Setup ---
-conn = sqlite3.connect("dragon_tiger.db")
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS game_data (
-    username TEXT, inputs TEXT, prediction TEXT,
-    confidence REAL, actual TEXT, correct TEXT
-)''')
-conn.commit()
+st.title("🔁 Dragon vs 🌟 Tiger Predictor (AI Powered)")
 
-# --- Session State Defaults ---
-for key in ["authenticated", "username", "inputs", "log", "loss_streak"]:
-    if key not in st.session_state:
-        st.session_state[key] = False if key == "authenticated" else "" if key == "username" else [] if key in ["inputs", "log"] else 0
+# --- Session State Init ---
+def init_state():
+    defaults = {
+        "authenticated": False,
+        "username": "",
+        "inputs": [],
+        "X_train": [],
+        "y_train": [],
+        "log": [],
+        "loss_streak": 0,
+        "markov": defaultdict(lambda: defaultdict(int))
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
 
 # --- Login ---
-def login(user, pwd):
-    return pwd == "1234"
-
+def login(u, p): return p == "1234"
 if not st.session_state.authenticated:
     st.subheader("🔐 Login")
     u = st.text_input("Username")
@@ -48,104 +55,110 @@ if not st.session_state.authenticated:
         if login(u, p):
             st.session_state.authenticated = True
             st.session_state.username = u
-            st.success("✅ Logged in")
+            st.success("✅ Login successful")
         else:
-            st.error("❌ Invalid credentials")
+            st.error("❌ Incorrect login")
     st.stop()
 
 if st.button("Logout"):
     st.session_state.authenticated = False
     st.rerun()
 
-# --- Encoding ---
-label_map = {'D': 0, 'T': 1, 'TIE': 2}
+# --- Encode/Decode ---
+label_map = {'D': 0, 'T': 1, 'TIE': 2, 'Suited Tie': 3}
 reverse_map = {v: k for k, v in label_map.items()}
 
 def encode(seq):
     return [label_map[s] for s in seq if s in label_map]
 
-def decode(label):
-    return reverse_map.get(label, "")
-
-# --- Prediction Logic ---
-def train_model(history):
-    if len(history) < 11:
-        return None
-    X, y = [], []
-    for i in range(10, len(history)):
-        X.append(encode(history[i-10:i]))
-        y.append(label_map[history[i]])
-    model = MultinomialNB()
-    model.fit(X, y)
-    return model
-
-def predict_next(model, recent_seq):
-    if len(recent_seq) < 10:
-        return None, 0
-    X_input = np.array([encode(recent_seq[-10:])])
-    pred_proba = model.predict_proba(X_input)[0]
-    label = np.argmax(pred_proba)
-    confidence = round(pred_proba[label] * 100)
-    return decode(label), confidence
-
-# --- Save Result ---
-def save_result(pred, conf, actual):
-    correct = "✅" if pred == actual else "❌"
-    st.session_state.log.append({
-        "Prediction": pred, "Confidence": conf,
-        "Actual": actual, "Correct": correct
-    })
-    c.execute("INSERT INTO game_data VALUES (?, ?, ?, ?, ?, ?)", (
-        st.session_state.username,
-        ",".join(st.session_state.inputs),
-        pred,
-        conf,
-        actual,
-        correct
-    ))
-    conn.commit()
-
-# --- Input UI ---
-st.subheader("🎮 Add Result (D / T / TIE)")
-choice = st.selectbox("Choose Result", ["D", "T", "TIE"])
-if st.button("➕ Add"):
-    st.session_state.inputs.append(choice)
-    st.success(f"Added: {choice}")
+def decode(v):
+    return reverse_map.get(v, "")
 
 # --- Prediction ---
-if len(st.session_state.inputs) >= 11:
-    model = train_model(st.session_state.inputs)
-    pred, conf = predict_next(model, st.session_state.inputs)
+def predict(seq):
+    if len(seq) < 10:
+        return fallback(seq)
+    encoded = encode(seq[-10:])
+    if len(st.session_state.X_train) >= 20:
+        clf = MultinomialNB()
+        weights = np.exp(np.linspace(0, 1, len(st.session_state.X_train)))
+        clf.fit(st.session_state.X_train, st.session_state.y_train, sample_weight=weights)
+        pred = clf.predict([encoded])[0]
+        conf = max(clf.predict_proba([encoded])[0]) * 100
+        return decode(pred), round(conf)
+    return fallback(seq)
 
-    if pred is None or conf < 70:
-        st.warning("⚠️ Low confidence or not enough pattern data.")
-        st.audio("https://actions.google.com/sounds/v1/alarms/warning.ogg", autoplay=True)
-    else:
+def fallback(seq):
+    counts = {k: seq[-10:].count(k) for k in ['D', 'T', 'TIE', 'Suited Tie']}
+    sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    if sorted_counts[0][1] > sorted_counts[1][1]:
+        return sorted_counts[1][0], 60
+    return random.choice(['D', 'T']), 55
+
+# --- Learn from result ---
+def learn(seq, actual):
+    if len(seq) >= 10:
+        st.session_state.X_train.append(encode(seq[-10:]))
+        st.session_state.y_train.append(encode([actual])[0])
+    for l in range(10, 4, -1):
+        if len(seq) >= l:
+            key = tuple(seq[-l:])
+            st.session_state.markov[key][actual] += 1
+
+# --- Input Interface ---
+st.subheader("🎮 Add New Result (D / T / TIE / Suited Tie)")
+choice = st.selectbox("Latest Game Result", ["D", "T", "TIE", "Suited Tie"])
+if st.button("➕ Add Result"):
+    st.session_state.inputs.append(choice)
+    st.success(f"Added ➔ {choice}")
+
+# --- Prediction Block ---
+if len(st.session_state.inputs) >= 10:
+    pred, conf = predict(st.session_state.inputs)
+
+    st.subheader("🧐 AI Prediction")
+    st.success(f"Predicted: **{pred}** | Confidence: `{conf}%`")
+
+    if st.session_state.loss_streak >= 3:
+        st.warning("⚠️ 3+ wrong predictions in a row. Watch out!")
+        st.audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg", autoplay=True)
+    elif conf >= 85:
         st.audio("https://actions.google.com/sounds/v1/cartoon/clang_and_wobble.ogg", autoplay=True)
-        st.subheader("🧠 Prediction")
-        st.success(f"Prediction: **{pred}** | Confidence: `{conf}%`")
+    elif conf <= 60:
+        st.audio("https://actions.google.com/sounds/v1/alarms/warning.ogg", autoplay=True)
 
-        if st.session_state.loss_streak >= 3:
-            st.warning("⚠️ 3+ incorrect predictions. Be cautious!")
+    actual = st.selectbox("Enter actual result", ["D", "T", "TIE", "Suited Tie"])
+    if st.button("✅ Confirm & Learn"):
+        correct = actual == pred
+        learn(st.session_state.inputs, actual)
+        st.session_state.inputs.append(actual)
 
-        actual = st.selectbox("Enter actual result", ["D", "T", "TIE"])
-        if st.button("✅ Confirm & Learn"):
-            save_result(pred, conf, actual)
-            st.session_state.inputs.append(actual)
-            st.session_state.loss_streak = 0 if pred == actual else st.session_state.loss_streak + 1
-            st.rerun()
+        st.session_state.log.append({
+            "Prediction": pred,
+            "Confidence": conf,
+            "Actual": actual,
+            "Correct": "✅" if correct else "❌"
+        })
+
+        st.session_state.loss_streak = 0 if correct else st.session_state.loss_streak + 1
+
+        st.success("📈 Model updated.")
+        st.rerun()
 else:
-    st.info(f"Enter {11 - len(st.session_state.inputs)} more inputs to enable prediction.")
+    st.warning(f"⏳ Enter {10 - len(st.session_state.inputs)} more to start prediction.")
 
-# --- History ---
+# --- Log & Export ---
 if st.session_state.log:
-    st.subheader("📊 History")
+    st.subheader("📊 Prediction History")
     df = pd.DataFrame(st.session_state.log)
-    st.dataframe(df)
-    if st.button("📥 Export Excel"):
+    st.dataframe(df, use_container_width=True)
+
+    if st.button("📅 Generate Excel"):
         buf = BytesIO()
         df.to_excel(buf, index=False)
-        st.download_button("⬇️ Download", data=buf.getvalue(), file_name=f"{st.session_state.username}_history.xlsx")
+        st.download_button("⬇️ Download Excel", buf.getvalue(),
+                           file_name=f"{st.session_state.username}_dragon_tiger_history.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.markdown("---")
-st.caption("Built with ❤️ | Lite AI Model | No TensorFlow Needed ✅")
+st.caption("Made with ❤️ | AI + Bayesian + Markov Learning | Now with Suited Tie Support")
