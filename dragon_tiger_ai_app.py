@@ -35,7 +35,7 @@ def play_sound(type):
 # ========== Memory ==========
 if "history" not in st.session_state:
     if os.path.exists("data/prediction_log.csv"):
-        st.session_state.history = deque(pd.read_csv("data/prediction_log.csv")["Result"].tolist(), maxlen=200)
+        st.session_state.history = deque(pd.read_csv("data/prediction_log.csv")['Result'].astype(str).tolist(), maxlen=200)
     else:
         st.session_state.history = deque(maxlen=200)
 
@@ -72,7 +72,7 @@ def find_streak(history):
     streaks = []
     for length in range(4, 11):
         if len(history) >= length:
-            recent = history[-length:]
+            recent = list(history)[-length:]
             if all(x == recent[0] for x in recent):
                 streaks.append((recent[0], length))
     return streaks[-1] if streaks else (None, 0)
@@ -84,9 +84,9 @@ with st.form("input_form"):
     submit = st.form_submit_button("➕ Add")
 
 if submit:
-    st.session_state.history.append(new_result)
+    st.session_state.history.append(str(new_result))
     update_bayes_model(st.session_state.history)
-    df = pd.DataFrame(st.session_state.history, columns=["Result"])
+    df = pd.DataFrame(list(st.session_state.history), columns=["Result"])
     os.makedirs("data", exist_ok=True)
     df.to_csv("data/prediction_log.csv", index=False)
     play_sound("ding")
@@ -123,7 +123,7 @@ else:
 
 # ========== Chart ==========
 if len(st.session_state.history) > 10:
-    df_chart = pd.DataFrame(st.session_state.history, columns=["Result"])
+    df_chart = pd.DataFrame(list(st.session_state.history), columns=["Result"])
     fig, ax = plt.subplots()
     df_chart["Result"].value_counts().plot(kind="bar", ax=ax, color=["#e74c3c", "#3498db", "#f1c40f", "#9b59b6"])
     plt.title("📊 Result Distribution")
@@ -131,5 +131,5 @@ if len(st.session_state.history) > 10:
 
 # ========== Export ==========
 if st.button("💾 Export to CSV"):
-    pd.DataFrame(st.session_state.history, columns=["Result"]).to_csv("data/prediction_log.csv", index=False)
+    pd.DataFrame(list(st.session_state.history), columns=["Result"]).to_csv("data/prediction_log.csv", index=False)
     st.success("✅ Exported to prediction_log.csv")
