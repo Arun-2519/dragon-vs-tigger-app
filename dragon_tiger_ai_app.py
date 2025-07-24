@@ -1,164 +1,111 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import random
-from collections import defaultdict
-from io import BytesIO
+import os
+from collections import deque, defaultdict, Counter
 
-# --- Safe import with clear error ---
-try:
-    from sklearn.naive_bayes import MultinomialNB
-except ModuleNotFoundError:
-    st.error("❌ Required module 'scikit-learn' not found. Please ensure it is listed in requirements.txt.")
-    st.stop()
-
-# --- App UI Config ---
-st.set_page_config(page_title="🔁🎟️ Dragon Tiger AI", layout="centered")
-st.markdown("""
-    <style>
-        body { background-color: #0f1117; color: #ffffff; }
-        .stButton>button {
-            background-color: #9c27b0;
-            color: white;
-            font-weight: bold;
-        }
-    </style>
-""", unsafe_allow_html=True)
-
-st.title("🔁 Dragon vs 🌟 Tiger Predictor (AI Powered)")
-
-# --- Session State Init ---
-def init_state():
-    defaults = {
-        "authenticated": False,
-        "username": "",
-        "inputs": [],
-        "X_train": [],
-        "y_train": [],
-        "log": [],
-        "loss_streak": 0,
-        "markov": defaultdict(lambda: defaultdict(int))
+# ========== SOUND ==========
+def play_sound(type):
+    sounds = {
+        "ding": "https://www.soundjay.com/button/sounds/button-16.mp3",
+        "wait": "https://www.soundjay.com/button/sounds/button-10.mp3",
+        "high_confidence": "https://www.soundjay.com/button/sounds/button-3.mp3"
     }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    if type in sounds:
+        st.audio(sounds[type], autoplay=True)
 
-init_state()
+# ========== MARKOV ==========
+def markov_predict(history):
+    last = history[-1]
+    trans = {
+        "Dragon": {"Dragon": 0.45, "Tiger": 0.4, "Tie": 0.15},
+        "Tiger": {"Dragon": 0.4, "Tiger": 0.5, "Tie": 0.1},
+        "Tie": {"Dragon": 0.5, "Tiger": 0.4, "Tie": 0.1}
+    }
+    prob = trans.get(last, {"Dragon": 0.33, "Tiger": 0.33, "Tie": 0.34})
+    pred = max(prob, key=prob.get)
+    return pred, prob[pred]*100
 
-# --- Login ---
-def login(u, p): return p == "1234"
-if not st.session_state.authenticated:
-    st.subheader("🔐 Login")
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if login(u, p):
-            st.session_state.authenticated = True
-            st.session_state.username = u
-            st.success("✅ Login successful")
-        else:
-            st.error("❌ Incorrect login")
-    st.stop()
+# ========== BAYES ==========
+pattern_memory = defaultdict(Counter)
 
-if st.button("Logout"):
-    st.session_state.authenticated = False
-    st.rerun()
+def naive_bayes_predict(history):
+    key = tuple(history[-3:]) if len(history) >= 4 else ("", "", "")
+    counts = pattern_memory.get(key, Counter({"Dragon":1,"Tiger":1,"Tie":1}))
+    pred = counts.most_common(1)[0][0]
+    total = sum(counts.values())
+    conf = (counts[pred] / total) * 100
+    return pred, conf
 
-# --- Encode/Decode ---
-label_map = {'D': 0, 'T': 1, 'TIE': 2, 'Suited Tie': 3}
-reverse_map = {v: k for k, v in label_map.items()}
+def update_bayes_model(history):
+    if len(history) >= 4:
+        key = tuple(history[-4:-1])
+        next_value = history[-1]
+        pattern_memory[key][next_value] += 1
 
-def encode(seq):
-    return [label_map[s] for s in seq if s in label_map]
+# ========== LSTM PLACEHOLDER ==========
+lstm_training_data = deque(maxlen=500)
 
-def decode(v):
-    return reverse_map.get(v, "")
+def lstm_predict(history):
+    if len(lstm_training_data) == 0:
+        return random.choice(["Dragon", "Tiger", "Tie"]), 55
+    return random.choice(["Dragon", "Tiger", "Tie"]), 65
 
-# --- Prediction ---
-def predict(seq):
-    if len(seq) < 10:
-        return fallback(seq)
-    encoded = encode(seq[-10:])
-    if len(st.session_state.X_train) >= 20:
-        clf = MultinomialNB()
-        weights = np.exp(np.linspace(0, 1, len(st.session_state.X_train)))
-        clf.fit(st.session_state.X_train, st.session_state.y_train, sample_weight=weights)
-        pred = clf.predict([encoded])[0]
-        conf = max(clf.predict_proba([encoded])[0]) * 100
-        return decode(pred), round(conf)
-    return fallback(seq)
+def train_lstm_model(history):
+    if len(history) >= 4:
+        lstm_training_data.append(tuple(history[-4:]))
 
-def fallback(seq):
-    counts = {k: seq[-10:].count(k) for k in ['D', 'T', 'TIE', 'Suited Tie']}
-    sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    if sorted_counts[0][1] > sorted_counts[1][1]:
-        return sorted_counts[1][0], 60
-    return random.choice(['D', 'T']), 55
+# ========== HYBRID ==========
+def hybrid_predict(markov, bayes, lstm):
+    votes = {}
+    for name, conf in [markov, bayes, lstm]:
+        votes[name] = votes.get(name, 0) + conf
+    final = max(votes, key=votes.get)
+    total = sum(votes.values())
+    return final, (votes[final] / total) * 100
 
-# --- Learn from result ---
-def learn(seq, actual):
-    if len(seq) >= 10:
-        st.session_state.X_train.append(encode(seq[-10:]))
-        st.session_state.y_train.append(encode([actual])[0])
-    for l in range(10, 4, -1):
-        if len(seq) >= l:
-            key = tuple(seq[-l:])
-            st.session_state.markov[key][actual] += 1
+# ========== MAIN UI ==========
+st.set_page_config(page_title="\ud83d\udd81\ufe0f Dragon Tiger AI", layout="centered")
+st.title("\ud83d\udd81\ufe0f Dragon vs Tiger AI Predictor")
 
-# --- Input Interface ---
-st.subheader("🎮 Add New Result (D / T / TIE / Suited Tie)")
-choice = st.selectbox("Latest Game Result", ["D", "T", "TIE", "Suited Tie"])
-if st.button("➕ Add Result"):
-    st.session_state.inputs.append(choice)
-    st.success(f"Added ➔ {choice}")
+if "history" not in st.session_state:
+    if os.path.exists("data/prediction_log.csv"):
+        st.session_state.history = deque(pd.read_csv("data/prediction_log.csv")["Result"].tolist(), maxlen=50)
+    else:
+        st.session_state.history = deque(maxlen=50)
 
-# --- Prediction Block ---
-if len(st.session_state.inputs) >= 10:
-    pred, conf = predict(st.session_state.inputs)
+with st.form("input_form"):
+    choice = st.selectbox("Enter Last Result", ["Dragon", "Tiger", "Tie"])
+    submit = st.form_submit_button("\u2705 Add Result")
 
-    st.subheader("🧐 AI Prediction")
-    st.success(f"Predicted: **{pred}** | Confidence: `{conf}%`")
+if submit:
+    st.session_state.history.append(choice)
+    df = pd.DataFrame(list(st.session_state.history), columns=["Result"])
+    os.makedirs("data", exist_ok=True)
+    df.to_csv("data/prediction_log.csv", index=False)
+    play_sound("ding")
 
-    if st.session_state.loss_streak >= 3:
-        st.warning("⚠️ 3+ wrong predictions in a row. Watch out!")
-        st.audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg", autoplay=True)
-    elif conf >= 85:
-        st.audio("https://actions.google.com/sounds/v1/cartoon/clang_and_wobble.ogg", autoplay=True)
-    elif conf <= 60:
-        st.audio("https://actions.google.com/sounds/v1/alarms/warning.ogg", autoplay=True)
+st.write("\ud83d\udcdf Last 10 Rounds:", list(st.session_state.history)[-10:])
 
-    actual = st.selectbox("Enter actual result", ["D", "T", "TIE", "Suited Tie"])
-    if st.button("✅ Confirm & Learn"):
-        correct = actual == pred
-        learn(st.session_state.inputs, actual)
-        st.session_state.inputs.append(actual)
+if len(st.session_state.history) >= 5:
+    markov_pred, markov_conf = markov_predict(st.session_state.history)
+    bayes_pred, bayes_conf = naive_bayes_predict(st.session_state.history)
+    lstm_pred, lstm_conf = lstm_predict(st.session_state.history)
+    final_pred, confidence = hybrid_predict((markov_pred, markov_conf), (bayes_pred, bayes_conf), (lstm_pred, lstm_conf))
 
-        st.session_state.log.append({
-            "Prediction": pred,
-            "Confidence": conf,
-            "Actual": actual,
-            "Correct": "✅" if correct else "❌"
-        })
+    st.subheader(f"\ud83d\udd2e Prediction: **{final_pred}**")
+    st.markdown(f"**Confidence:** `{confidence:.2f}%`")
 
-        st.session_state.loss_streak = 0 if correct else st.session_state.loss_streak + 1
+    if confidence >= 70:
+        play_sound("high_confidence")
+    elif confidence < 50:
+        play_sound("wait")
+        st.warning("\u26d4\ufe0f Low confidence. Suggest to WAIT.")
 
-        st.success("📈 Model updated.")
-        st.rerun()
-else:
-    st.warning(f"⏳ Enter {10 - len(st.session_state.inputs)} more to start prediction.")
+    update_bayes_model(st.session_state.history)
+    train_lstm_model(st.session_state.history)
 
-# --- Log & Export ---
-if st.session_state.log:
-    st.subheader("📊 Prediction History")
-    df = pd.DataFrame(st.session_state.log)
-    st.dataframe(df, use_container_width=True)
-
-    if st.button("📅 Generate Excel"):
-        buf = BytesIO()
-        df.to_excel(buf, index=False)
-        st.download_button("⬇️ Download Excel", buf.getvalue(),
-                           file_name=f"{st.session_state.username}_dragon_tiger_history.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-st.markdown("---")
-st.caption("Made with ❤️ | AI + Bayesian + Markov Learning | Now with Suited Tie Support")
+if st.button("\ud83d\udcc5 Export to Excel"):
+    df = pd.DataFrame(list(st.session_state.history), columns=["Result"])
+    df.to_csv("data/prediction_log.csv", index=False)
+    st.success("Saved!")
