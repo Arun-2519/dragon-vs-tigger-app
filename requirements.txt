@@ -1,6 +1,5 @@
-streamlit==1.47.0
+streamlit
 pandas
 numpy
-tensorflow
-sqlite3  # ← optional: built-in with Python, so remove if error occurs
-openpyxl  # for Excel export
+tensorflow==2.12.0
+openpyxl
