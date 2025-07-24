@@ -1,168 +1,167 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import random
-import os
-import matplotlib.pyplot as plt
-from collections import deque, defaultdict, Counter
-from sklearn.linear_model import LogisticRegression
+from collections import defaultdict
+from io import BytesIO
 
-# Page config
-st.set_page_config(page_title="🐉 Dragon Tiger AI", layout="centered")
+# Safe import with clear error for Streamlit Cloud
+try:
+    from sklearn.naive_bayes import MultinomialNB
+except ModuleNotFoundError:
+    st.error("❌ Required module 'scikit-learn' not found. Please ensure it is listed in requirements.txt.")
+    st.stop()
 
-# --- Setup ---
-if "history" not in st.session_state:
-    if os.path.exists("data/prediction_log.csv"):
-        st.session_state.history = deque(pd.read_csv("data/prediction_log.csv")["Result"].tolist(), maxlen=200)
-    else:
-        st.session_state.history = deque(maxlen=200)
+# --- App UI Config ---
+st.set_page_config(page_title="🐉🆚🐯 Dragon Tiger AI", layout="centered")
+st.markdown("""
+    <style>
+        body { background-color: #0f1117; color: #ffffff; }
+        .stButton>button {
+            background-color: #9c27b0;
+            color: white;
+            font-weight: bold;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-if "X" not in st.session_state: st.session_state.X = []
-if "y" not in st.session_state: st.session_state.y = []
-if "model" not in st.session_state: st.session_state.model = LogisticRegression()
-if "pattern_memory" not in st.session_state: st.session_state.pattern_memory = defaultdict(Counter)
-if "streak_alerted" not in st.session_state: st.session_state.streak_alerted = False
+st.title("🐉 Dragon vs 🐯 Tiger Predictor (AI Powered)")
 
-# --- Helper ---
-def encode(val):
-    return {"Dragon": 0, "Tiger": 1, "Tie": 2, "Suited Tie": 3}.get(val, -1)
-def decode(val):
-    return {0: "Dragon", 1: "Tiger", 2: "Tie", 3: "Suited Tie"}.get(val, "Unknown")
+# --- Session State Init ---
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "username" not in st.session_state:
+    st.session_state.username = ""
+if "inputs" not in st.session_state:
+    st.session_state.inputs = []
+if "X_train" not in st.session_state:
+    st.session_state.X_train = []
+if "y_train" not in st.session_state:
+    st.session_state.y_train = []
+if "log" not in st.session_state:
+    st.session_state.log = []
+if "loss_streak" not in st.session_state:
+    st.session_state.loss_streak = 0
+if "markov" not in st.session_state:
+    st.session_state.markov = defaultdict(lambda: defaultdict(int))
 
-def play_sound(alert_type):
-    sounds = {
-        "ding": "https://www.soundjay.com/button/sounds/button-16.mp3",
-        "wait": "https://www.soundjay.com/button/sounds/button-10.mp3",
-        "high": "https://www.soundjay.com/button/sounds/button-3.mp3"
-    }
-    if alert_type in sounds:
-        st.audio(sounds[alert_type], autoplay=True)
-
-# --- Prediction Modules ---
-def markov_predict(history):
-    last = history[-1]
-    trans = {
-        "Dragon": {"Dragon": 0.4, "Tiger": 0.4, "Tie": 0.1, "Suited Tie": 0.1},
-        "Tiger": {"Tiger": 0.4, "Dragon": 0.4, "Tie": 0.1, "Suited Tie": 0.1},
-        "Tie": {"Dragon": 0.35, "Tiger": 0.35, "Tie": 0.2, "Suited Tie": 0.1},
-        "Suited Tie": {"Dragon": 0.4, "Tiger": 0.4, "Tie": 0.1, "Suited Tie": 0.1}
-    }
-    prob = trans.get(last, {"Dragon": 0.25, "Tiger": 0.25, "Tie": 0.25, "Suited Tie": 0.25})
-    pred = max(prob, key=prob.get)
-    return pred, prob[pred]*100
-
-def naive_bayes_predict(history):
-    if len(history) < 4: return random.choice(["Dragon", "Tiger", "Tie", "Suited Tie"]), 50
-    key = tuple(history[-3:])
-    counts = st.session_state.pattern_memory.get(key, Counter())
-    if not counts: return random.choice(["Dragon", "Tiger", "Tie", "Suited Tie"]), 50
-    pred, cnt = counts.most_common(1)[0]
-    total = sum(counts.values())
-    conf = (cnt / total) * 100
-    return pred, conf
-
-def update_bayes_model(history):
-    if len(history) >= 4:
-        key = tuple(history[-4:-1])
-        next_val = history[-1]
-        st.session_state.pattern_memory[key][next_val] += 1
-
-def train_lstm_model():
-    if len(st.session_state.X) >= 10:
-        st.session_state.model.fit(st.session_state.X, st.session_state.y)
-
-def lstm_predict(history):
-    if len(history) < 14: return random.choice(["Dragon", "Tiger", "Tie", "Suited Tie"]), 50
-    input_seq = [encode(val) for val in list(history)[-4:]]
-    prob = st.session_state.model.predict_proba([input_seq])[0]
-    pred = decode(np.argmax(prob))
-    conf = max(prob) * 100
-    return pred, conf
-
-def hybrid_vote(preds):
-    vote_counter = defaultdict(float)
-    for label, conf in preds:
-        vote_counter[label] += conf
-    final = max(vote_counter, key=vote_counter.get)
-    total_conf = vote_counter[final] / (sum(vote_counter.values()) + 1e-5) * 100
-    return final, total_conf
-
-# --- Input Form ---
-st.title("🐉 Dragon vs Tiger AI Predictor")
-threshold = st.slider("🎯 Confidence Threshold", 50, 100, 70)
-
-with st.form("input_form"):
-    choice = st.selectbox("📥 Add Game Result", ["Dragon", "Tiger", "Tie", "Suited Tie"])
-    submit = st.form_submit_button("✅ Add Result")
-
-if submit:
-    st.session_state.history.append(choice)
-    update_bayes_model(st.session_state.history)
-    if len(st.session_state.history) >= 14:
-        encoded = [encode(x) for x in list(st.session_state.history)[-14:-4]]
-        target = encode(st.session_state.history[-1])
-        st.session_state.X.append(encoded)
-        st.session_state.y.append(target)
-        train_lstm_model()
-    df = pd.DataFrame(list(st.session_state.history), columns=["Result"])
-    os.makedirs("data", exist_ok=True)
-    df.to_csv("data/prediction_log.csv", index=False)
-    play_sound("ding")
-
-# --- Display History ---
-st.subheader("🕗 Last 10 Rounds:")
-st.code(list(st.session_state.history)[-10:])
-
-# --- Predict if enough data ---
-if len(st.session_state.history) >= 14:
-    markov_pred, markov_conf = markov_predict(st.session_state.history)
-    bayes_pred, bayes_conf = naive_bayes_predict(st.session_state.history)
-    lstm_pred, lstm_conf = lstm_predict(st.session_state.history)
-
-    final_pred, final_conf = hybrid_vote([
-        (markov_pred, markov_conf),
-        (bayes_pred, bayes_conf),
-        (lstm_pred, lstm_conf)
-    ])
-
-    st.subheader("🔮 AI Prediction")
-    st.markdown(f"**Prediction:** `{final_pred}`")
-    st.markdown(f"**Confidence:** `{final_conf:.2f}%`")
-
-    if final_conf < threshold:
-        play_sound("wait")
-        st.warning("⛔ Low confidence. Suggest to WAIT.")
-    elif final_conf >= 85:
-        play_sound("high")
-
-    # 🔁 Streak detection
-    streak = 1
-    last = st.session_state.history[-1]
-    for prev in reversed(st.session_state.history[:-1]):
-        if prev == last:
-            streak += 1
+# --- Login ---
+def login(u, p): return p == "1234"
+if not st.session_state.authenticated:
+    st.subheader("🔐 Login")
+    u = st.text_input("Username")
+    p = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if login(u, p):
+            st.session_state.authenticated = True
+            st.session_state.username = u
+            st.success("✅ Login successful")
         else:
-            break
-    if streak >= 4 and not st.session_state.streak_alerted:
-        st.warning(f"🔥 `{streak}`-Round Streak Detected: {last}")
-        st.session_state.streak_alerted = True
-    elif streak < 4:
-        st.session_state.streak_alerted = False
+            st.error("❌ Incorrect login")
+    st.stop()
 
-# --- Chart ---
-if len(st.session_state.history) > 0:
-    st.subheader("📊 Result Frequency")
-    result_df = pd.DataFrame(st.session_state.history, columns=["Result"])
-    freq = result_df["Result"].value_counts()
-    fig, ax = plt.subplots()
-    freq.plot(kind="bar", color=["green", "red", "blue", "purple"], ax=ax)
-    st.pyplot(fig)
+if st.button("Logout"):
+    st.session_state.authenticated = False
+    st.rerun()
 
-# --- Export CSV ---
-if st.button("💾 Export CSV"):
-    df = pd.DataFrame(list(st.session_state.history), columns=["Result"])
-    df.to_csv("data/prediction_log.csv", index=False)
-    st.success("📁 Saved as `data/prediction_log.csv`")
+# --- Encode/Decode ---
+def encode(seq):
+    m = {'D': 0, 'T': 1, 'TIE': 2}
+    return [m[s] for s in seq if s in m]
+def decode(v):
+    m = {0: 'D', 1: 'T', 2: 'TIE'}
+    return m.get(v, "")
+
+# --- Prediction ---
+def predict(seq):
+    if len(seq) < 10:
+        return fallback(seq)
+    encoded = encode(seq[-10:])
+    if len(st.session_state.X_train) >= 20:
+        clf = MultinomialNB()
+        weights = np.exp(np.linspace(0, 1, len(st.session_state.X_train)))
+        clf.fit(st.session_state.X_train, st.session_state.y_train, sample_weight=weights)
+        pred = clf.predict([encoded])[0]
+        conf = max(clf.predict_proba([encoded])[0]) * 100
+        return decode(pred), round(conf)
+    return fallback(seq)
+
+def fallback(seq):
+    d = seq[-10:].count("D")
+    t = seq[-10:].count("T")
+    tie = seq[-10:].count("TIE")
+    if d > t and d > tie: return "T", 60
+    elif t > d and t > tie: return "D", 60
+    return random.choice(["D", "T"]), 55
+
+# --- Learn from result ---
+def learn(seq, actual):
+    if len(seq) >= 10:
+        st.session_state.X_train.append(encode(seq[-10:]))
+        st.session_state.y_train.append(encode([actual])[0])
+    for l in range(10, 4, -1):
+        if len(seq) >= l:
+            key = tuple(seq[-l:])
+            st.session_state.markov[key][actual] += 1
+
+# --- Input Interface ---
+st.subheader("🎮 Add New Result (D / T / TIE)")
+choice = st.selectbox("Latest Game Result", ["D", "T", "TIE"])
+if st.button("➕ Add Result"):
+    st.session_state.inputs.append(choice)
+    st.success(f"Added ➡️ {choice}")
+
+# --- Prediction Block ---
+if len(st.session_state.inputs) >= 10:
+    pred, conf = predict(st.session_state.inputs)
+
+    st.subheader("🧠 AI Prediction")
+    st.success(f"Predicted: **{pred}** | Confidence: `{conf}%`")
+
+    if st.session_state.loss_streak >= 3:
+        st.warning("⚠️ 3+ wrong predictions in a row. Watch out!")
+        st.audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg", autoplay=True)
+    elif conf >= 85:
+        st.audio("https://actions.google.com/sounds/v1/cartoon/clang_and_wobble.ogg", autoplay=True)
+    elif conf <= 60:
+        st.audio("https://actions.google.com/sounds/v1/alarms/warning.ogg", autoplay=True)
+
+    actual = st.selectbox("Enter actual result", ["D", "T", "TIE"])
+    if st.button("✅ Confirm & Learn"):
+        correct = actual == pred
+        learn(st.session_state.inputs, actual)
+        st.session_state.inputs.append(actual)
+
+        st.session_state.log.append({
+            "Prediction": pred,
+            "Confidence": conf,
+            "Actual": actual,
+            "Correct": "✅" if correct else "❌"
+        })
+
+        if correct:
+            st.session_state.loss_streak = 0
+        else:
+            st.session_state.loss_streak += 1
+
+        st.success("📈 Model updated.")
+        st.rerun()
+else:
+    st.warning(f"⏳ Enter {10 - len(st.session_state.inputs)} more to start prediction.")
+
+# --- Log & Export ---
+if st.session_state.log:
+    st.subheader("📊 Prediction History")
+    df = pd.DataFrame(st.session_state.log)
+    st.dataframe(df, use_container_width=True)
+
+    if st.button("📥 Generate Excel"):
+        buf = BytesIO()
+        df.to_excel(buf, index=False)
+        st.download_button("⬇️ Download Excel", buf.getvalue(),
+                           file_name=f"{st.session_state.username}_dragon_tiger_history.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.markdown("---")
-st.caption("🤖 Built by Vendra | Hybrid AI Model | Live Pattern Learning | Streamlit Deployment Ready")
+st.caption("Made with ❤️ | AI + Bayesian + Markov Learning")
