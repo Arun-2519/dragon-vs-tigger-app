@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,14 +5,14 @@ import random
 from collections import defaultdict
 from io import BytesIO
 
-# Safe import with clear error for Streamlit Cloud
+# ========== Safe import ==========
 try:
     from sklearn.naive_bayes import MultinomialNB
 except ModuleNotFoundError:
-    st.error("❌ Required module 'scikit-learn' not found. Please ensure it is listed in requirements.txt.")
+    st.error("❌ Required module 'scikit-learn' not found. Please add to `requirements.txt`.")
     st.stop()
 
-# --- App UI Config ---
+# ========== App Config ==========
 st.set_page_config(page_title="🐉🆚🐯 Dragon Tiger AI", layout="centered")
 st.markdown("""
     <style>
@@ -25,28 +24,23 @@ st.markdown("""
         }
     </style>
 """, unsafe_allow_html=True)
-
 st.title("🐉 Dragon vs 🐯 Tiger Predictor (AI Powered)")
 
-# --- Session State Init ---
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if "username" not in st.session_state:
-    st.session_state.username = ""
-if "inputs" not in st.session_state:
-    st.session_state.inputs = []
-if "X_train" not in st.session_state:
-    st.session_state.X_train = []
-if "y_train" not in st.session_state:
-    st.session_state.y_train = []
-if "log" not in st.session_state:
-    st.session_state.log = []
-if "loss_streak" not in st.session_state:
-    st.session_state.loss_streak = 0
-if "markov" not in st.session_state:
-    st.session_state.markov = defaultdict(lambda: defaultdict(int))
+# ========== Session State ==========
+for key, default in {
+    "authenticated": False,
+    "username": "",
+    "inputs": [],
+    "X_train": [],
+    "y_train": [],
+    "log": [],
+    "loss_streak": 0,
+    "markov": defaultdict(lambda: defaultdict(int))
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# --- Login ---
+# ========== Login ==========
 def login(u, p): return p == "1234"
 if not st.session_state.authenticated:
     st.subheader("🔐 Login")
@@ -65,18 +59,16 @@ if st.button("Logout"):
     st.session_state.authenticated = False
     st.rerun()
 
-# --- Encode/Decode ---
+# ========== Encode / Decode ==========
 def encode(seq):
-    m = {'D': 0, 'T': 1, 'TIE': 2}
-    return [m[s] for s in seq if s in m]
-def decode(v):
-    m = {0: 'D', 1: 'T', 2: 'TIE'}
-    return m.get(v, "")
+    return [ {'D':0, 'T':1, 'TIE':2}.get(s, -1) for s in seq ]
+def decode(i):
+    return {0:'D', 1:'T', 2:'TIE'}.get(i, '')
 
-# --- Prediction ---
+# ========== Prediction ==========
 def predict(seq):
-    if len(seq) < 10:
-        return fallback(seq)
+    if len(seq) < 10: return fallback(seq)
+
     encoded = encode(seq[-10:])
     if len(st.session_state.X_train) >= 20:
         clf = MultinomialNB()
@@ -88,14 +80,13 @@ def predict(seq):
     return fallback(seq)
 
 def fallback(seq):
-    d = seq[-10:].count("D")
-    t = seq[-10:].count("T")
-    tie = seq[-10:].count("TIE")
-    if d > t and d > tie: return "T", 60
-    elif t > d and t > tie: return "D", 60
-    return random.choice(["D", "T"]), 55
+    count = { "D":seq[-10:].count("D"), "T":seq[-10:].count("T"), "TIE":seq[-10:].count("TIE") }
+    best = max(count, key=count.get)
+    second = sorted(count.values(), reverse=True)[1]
+    confidence = 60 if count[best] > second else 55
+    return best, confidence
 
-# --- Learn from result ---
+# ========== Learn ==========
 def learn(seq, actual):
     if len(seq) >= 10:
         st.session_state.X_train.append(encode(seq[-10:]))
@@ -105,20 +96,21 @@ def learn(seq, actual):
             key = tuple(seq[-l:])
             st.session_state.markov[key][actual] += 1
 
-# --- Input Interface ---
-st.subheader("🎮 Add New Result (D / T / TIE)")
+# ========== Input ==========
+st.subheader("🎮 Add New Result")
 choice = st.selectbox("Latest Game Result", ["D", "T", "TIE"])
 if st.button("➕ Add Result"):
     st.session_state.inputs.append(choice)
     st.success(f"Added ➡️ {choice}")
 
-# --- Prediction Block ---
+# ========== Prediction ==========
 if len(st.session_state.inputs) >= 10:
     pred, conf = predict(st.session_state.inputs)
 
     st.subheader("🧠 AI Prediction")
-    st.success(f"Predicted: **{pred}** | Confidence: `{conf}%`")
+    st.success(f"Prediction: **{pred}** | Confidence: `{conf}%`")
 
+    # --- Sound Alerts ---
     if st.session_state.loss_streak >= 3:
         st.warning("⚠️ 3+ wrong predictions in a row. Watch out!")
         st.audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg", autoplay=True)
@@ -127,9 +119,10 @@ if len(st.session_state.inputs) >= 10:
     elif conf <= 60:
         st.audio("https://actions.google.com/sounds/v1/alarms/warning.ogg", autoplay=True)
 
+    # --- User Confirm Actual Outcome ---
     actual = st.selectbox("Enter actual result", ["D", "T", "TIE"])
     if st.button("✅ Confirm & Learn"):
-        correct = actual == pred
+        correct = (actual == pred)
         learn(st.session_state.inputs, actual)
         st.session_state.inputs.append(actual)
 
@@ -150,7 +143,7 @@ if len(st.session_state.inputs) >= 10:
 else:
     st.warning(f"⏳ Enter {10 - len(st.session_state.inputs)} more to start prediction.")
 
-# --- Log & Export ---
+# ========== History ==========
 if st.session_state.log:
     st.subheader("📊 Prediction History")
     df = pd.DataFrame(st.session_state.log)
@@ -164,4 +157,4 @@ if st.session_state.log:
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.markdown("---")
-st.caption("Made with ❤️ | AI + Bayesian + Markov Learning")
+st.caption("🤖 Built by Vendra | Hybrid AI + Markov + Naive Bayes | Streamlit Deployed")
