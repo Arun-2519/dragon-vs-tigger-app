@@ -6,18 +6,20 @@ import random
 from collections import defaultdict
 from io import BytesIO
 
+# --- Try importing TensorFlow ---
 try:
     import tensorflow as tf
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Embedding
 except ModuleNotFoundError:
-    st.error("❌ Required module 'tensorflow' not found. Please ensure it is listed in requirements.txt.")
+    st.error("❌ TensorFlow not found. Please make sure it's in your requirements.txt")
     st.stop()
 
-st.set_page_config(page_title="🐉⚖️🌟 Dragon Tiger AI (LSTM Powered)", layout="centered")
-st.title("🐉 Dragon vs 🌟 Tiger Predictor (World-Class AI)")
+# --- Streamlit Page Settings ---
+st.set_page_config(page_title="🐉⚖️🌟 Dragon Tiger AI (LSTM)", layout="centered")
+st.title("🐉 Dragon vs 🌟 Tiger Predictor (AI Powered by LSTM)")
 
-# --- Styles ---
+# --- CSS Styling ---
 st.markdown("""
     <style>
         body { background-color: #0f1117; color: #ffffff; }
@@ -29,28 +31,26 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- Database ---
+# --- Database Init ---
 conn = sqlite3.connect("dragon_tiger.db")
 c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS game_data (username TEXT, inputs TEXT, prediction TEXT, confidence REAL, actual TEXT, correct TEXT)''')
+c.execute('''
+    CREATE TABLE IF NOT EXISTS game_data (
+        username TEXT, inputs TEXT, prediction TEXT,
+        confidence REAL, actual TEXT, correct TEXT
+    )
+''')
 conn.commit()
 
 # --- Session State ---
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if "username" not in st.session_state:
-    st.session_state.username = ""
-if "inputs" not in st.session_state:
-    st.session_state.inputs = []
-if "log" not in st.session_state:
-    st.session_state.log = []
-if "loss_streak" not in st.session_state:
-    st.session_state.loss_streak = 0
-if "model" not in st.session_state:
-    st.session_state.model = None
+for key in ["authenticated", "username", "inputs", "log", "loss_streak", "model"]:
+    if key not in st.session_state:
+        st.session_state[key] = False if key == "authenticated" else ("" if key == "username" else [] if key in ["inputs", "log"] else 0)
 
 # --- Login ---
-def login(user, pwd): return pwd == "1234"
+def login(user, pwd):
+    return pwd == "1234"
+
 if not st.session_state.authenticated:
     st.subheader("🔐 Login")
     u = st.text_input("Username")
@@ -63,21 +63,22 @@ if not st.session_state.authenticated:
         else:
             st.error("❌ Invalid login")
     st.stop()
+
 if st.button("Logout"):
     st.session_state.authenticated = False
     st.rerun()
 
-# --- Encode/Decode ---
+# --- Label Encoding ---
 label_map = {'D': 0, 'T': 1, 'TIE': 2}
 reverse_map = {v: k for k, v in label_map.items()}
 
 def encode(seq):
-    return [label_map[s] for s in seq if s in label_map]
+    return [label_map.get(s, 0) for s in seq]
 
-def decode(v):
-    return reverse_map.get(v, "")
+def decode(idx):
+    return reverse_map.get(idx, "")
 
-# --- Build or Load LSTM ---
+# --- LSTM Model ---
 def build_lstm_model():
     model = Sequential([
         Embedding(input_dim=3, output_dim=10, input_length=10),
@@ -87,12 +88,11 @@ def build_lstm_model():
     model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
     return model
 
-# --- Predict ---
+# --- Prediction Logic ---
 def lstm_predict(seq):
     if len(seq) < 10:
         return None, 0
-    X = []
-    y = []
+    X, y = [], []
     for i in range(10, len(seq)):
         X.append(encode(seq[i-10:i]))
         y.append(encode([seq[i]])[0])
@@ -105,7 +105,7 @@ def lstm_predict(seq):
     result = np.argmax(pred)
     return decode(result), round(np.max(pred) * 100)
 
-# --- Learn & Save ---
+# --- Save Result ---
 def save_result(pred, conf, actual):
     correct = "✅" if pred == actual else "❌"
     st.session_state.log.append({
@@ -131,7 +131,7 @@ if st.button("➕ Add Result"):
     st.session_state.inputs.append(choice)
     st.success(f"Added: {choice}")
 
-# --- Prediction ---
+# --- AI Prediction ---
 if len(st.session_state.inputs) >= 10:
     pred, conf = lstm_predict(st.session_state.inputs)
     if pred is None or conf < 85:
@@ -152,10 +152,9 @@ if len(st.session_state.inputs) >= 10:
             st.session_state.loss_streak = 0 if pred == actual else st.session_state.loss_streak + 1
             st.rerun()
 else:
-    needed = 10 - len(st.session_state.inputs)
-    st.info(f"Enter {needed} more inputs to begin prediction.")
+    st.info(f"Enter {10 - len(st.session_state.inputs)} more inputs to begin prediction.")
 
-# --- History ---
+# --- History View ---
 if st.session_state.log:
     st.subheader("📊 Prediction History")
     df = pd.DataFrame(st.session_state.log)
@@ -166,4 +165,4 @@ if st.session_state.log:
         st.download_button("⬇️ Download Excel", data=buf.getvalue(), file_name=f"{st.session_state.username}_history.xlsx")
 
 st.markdown("---")
-st.caption("Built with ❤️ using Streamlit + LSTM + Real-Time Memory")
+st.caption("Built with ❤️ using Streamlit + LSTM + Realtime Memory")
