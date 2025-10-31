@@ -1,9 +1,5 @@
-streamlit>=1.30.0
+streamlit>=1.18
 pandas
 numpy
 scikit-learn
-xgboost==2.0.3
-joblib
 openpyxl
-xlsxwriter
-tensorflow==2.15.0
