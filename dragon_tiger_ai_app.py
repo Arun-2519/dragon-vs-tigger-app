@@ -4,110 +4,130 @@ import numpy as np
 from collections import defaultdict
 from io import BytesIO
 
-from sklearn.naive_bayes import MultinomialNB
+try:
+    from sklearn.naive_bayes import MultinomialNB
+except:
+    st.error("❌ scikit-learn is missing. Add to requirements.txt")
+    st.stop()
 
-# ---------------------- UI CONFIG ----------------------
+# -------------------------------- UI & STYLE -------------------------------
 st.set_page_config(page_title="🐉 Dragon vs 🌟 Tiger AI", layout="centered")
 
 st.markdown("""
 <style>
-body { background: #0b0f19; color: white; font-family: 'Poppins', sans-serif; }
-.stButton > button { background: linear-gradient(45deg,#7b2ff7,#f107a3); color:white; border-radius:10px; padding:10px 20px; font-weight:bold; }
-div[data-testid="stSelectbox"] label { font-size:18px; color:#f8f8f8; font-weight:600; }
+body {background: #0A0F24; color: white;}
+.stButton>button {
+    background: linear-gradient(90deg,#9b27b0,#2196f3);
+    color:white;font-weight:bold;border-radius:12px;padding:10px 25px;
+}
+div[data-testid="stSelectbox"] label, h1, h2, h3, h4 {color:#20e3b2;}
+.dataframe {background:white !important;color:black;}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🐉 Dragon vs 🌟 Tiger — AI Predictor")
-st.caption("Hybrid Pattern + Machine Learning Model")
 
-# ---------------------- SESSION ----------------------
-for key in ["inputs","X_train","y_train","log","loss_streak","csv_trained"]:
-    if key not in st.session_state:
-        st.session_state[key] = [] if key != "loss_streak" else 0
+# -------------------------------- STATE INIT -------------------------------
+if "inputs" not in st.session_state: st.session_state.inputs = []
+if "X_train" not in st.session_state: st.session_state.X_train = []
+if "y_train" not in st.session_state: st.session_state.y_train = []
+if "log" not in st.session_state: st.session_state.log = []
+if "loss_streak" not in st.session_state: st.session_state.loss_streak = 0
+if "csv_trained" not in st.session_state: st.session_state.csv_trained = False
 
-# ---------------------- HELPERS ----------------------
-encode = lambda seq: [{'D':0,'T':1,'TIE':2}[x] for x in seq]
-decode = lambda v: {0:'D',1:'T',2:'TIE'}[v]
+# -------------------------------- HELPERS ---------------------------------
+def encode(seq):
+    m = {"D":0, "T":1, "TIE":2}
+    return [m[s] for s in seq if s in m]
 
-def train_model():
-    if len(st.session_state.X_train) < 20: return None
-    clf = MultinomialNB()
-    w = np.exp(np.linspace(0,1,len(st.session_state.X_train)))
-    clf.fit(st.session_state.X_train, st.session_state.y_train, sample_weight=w)
-    return clf
+def decode(v):
+    return {0:"D",1:"T",2:"TIE"}.get(v)
+
+def clean_results(series):
+    return series.astype(str).str.upper().str.strip().replace({
+        "DRAGON":"D","TIGER":"T","PLAYER":"D","BANKER":"T",
+        "DT":"TIE","DRAW":"TIE","TIG":"T","DRA":"D"
+    })
+
+def train_model(results):
+    results = [r for r in results if r in ["D","T","TIE"]]
+    if len(results) < 20: return
+    for i in range(10, len(results)):
+        seq = results[i-10:i]
+        st.session_state.X_train.append(encode(seq))
+        st.session_state.y_train.append(encode([results[i]])[0])
 
 def predict(seq):
-    if len(seq) < 10 or len(st.session_state.X_train) < 20:
-        return None,0
-    clf = train_model(); encoded = encode(seq[-10:])
-    pred = clf.predict([encoded])[0]
-    prob = clf.predict_proba([encoded])[0]
-    return decode(pred), round(max(prob)*100)
+    if len(seq) < 10: return None, 0
+    if len(st.session_state.X_train) < 20: return None, 0
+    clf = MultinomialNB()
+    w = np.exp(np.linspace(0, 1, len(st.session_state.X_train)))
+    clf.fit(st.session_state.X_train, st.session_state.y_train, sample_weight=w)
+    p = clf.predict([encode(seq[-10:])])[0]
+    c = max(clf.predict_proba([encode(seq[-10:])])[0])*100
+    return decode(p), round(c,2)
 
-def learn(hist, actual):
-    if len(hist) >= 10:
-        st.session_state.X_train.append(encode(hist[-10:]))
+def learn_after_round(seq, actual):
+    if len(seq)>=10:
+        st.session_state.X_train.append(encode(seq[-10:]))
         st.session_state.y_train.append(encode([actual])[0])
 
-# ---------------------- CSV TRAINING ----------------------
-st.subheader("📂 Upload Past Game CSV")
-
-csv = st.file_uploader("Upload CSV containing results (D,T,TIE)", type=["csv"])
+# -------------------------------- CSV Upload -------------------------------
+st.subheader("📂 Upload History CSV")
+csv = st.file_uploader("Upload D vs T History (Period, Result)", type=["csv"])
 
 if csv and not st.session_state.csv_trained:
     data = pd.read_csv(csv)
-    results = data.iloc[:,0].astype(str).str.upper().tolist()
+    
+    if "Result" not in data.columns:
+        st.error("❌ CSV must have a 'Result' column")
+        st.stop()
 
-    for i in range(10, len(results)):
-        hist = results[i-10:i]
-        st.session_state.X_train.append(encode(hist))
-        st.session_state.y_train.append(encode([results[i]])[0])
-
+    results = clean_results(data["Result"]).tolist()
+    
+    train_model(results)
+    st.session_state.inputs = results[-20:]      # load last rounds to UI
     st.session_state.csv_trained = True
-    st.success(f"✅ CSV trained! Total patterns: {len(st.session_state.X_train)}")
-    st.rerun()
+    st.success(f"✅ CSV Loaded & Trained on {len(results)} rounds")
 
-# ---------------------- LIVE INPUT ----------------------
+# -------------------------------- USER INPUT -------------------------------
 st.subheader("🎮 Add Live Result")
-choice = st.selectbox("Select result:", ["D","T","TIE"])
 
-if st.button("Add Result ✅"):
+choice = st.selectbox("Choose Result", ["D","T","TIE"])
+
+if st.button("➕ Add Result"):
     st.session_state.inputs.append(choice)
-    st.success(f"Added {choice}")
+    st.success(f"✅ Added {choice}")
 
-    if len(st.session_state.inputs)>=11:
-        learn(st.session_state.inputs, choice)
-
-    st.rerun()
-
-# ---------------------- PREDICTION BOX ----------------------
-if len(st.session_state.inputs) >= 10 and len(st.session_state.X_train)>=20:
+# -------------------------------- PREDICT ---------------------------------
+if len(st.session_state.inputs) >= 10:
     pred, conf = predict(st.session_state.inputs)
 
-    st.subheader("🤖 AI Prediction")
-    st.metric("Prediction", pred, f"{conf}% confidence")
+    if not pred or conf < 55:
+        st.warning("⚠️ Collecting patterns... Low confidence")
+    else:
+        st.success(f"🧠 Prediction: **{pred}** | Confidence: {conf}%")
 
-    actual = st.selectbox("Actual result?", ["D","T","TIE"])
-    if st.button("Confirm & Train More 🧠"):
-        correct = actual == pred
-        st.session_state.log.append({"Prediction":pred,"Confidence":conf,"Actual":actual,"Correct":correct})
+    # Confirm actual
+    actual = st.selectbox("Enter actual result", ["D","T","TIE"])
 
-        learn(st.session_state.inputs, actual)
+    if st.button("✅ Confirm & Train"):
+        ok = (pred == actual)
+        st.session_state.log.append({
+            "Prediction":pred, "Confidence":conf,
+            "Actual":actual, "Correct":"✅" if ok else "❌"
+        })
+        learn_after_round(st.session_state.inputs, actual)
         st.session_state.inputs.append(actual)
-
-        if correct: st.session_state.loss_streak = 0
-        else: st.session_state.loss_streak += 1
-
         st.rerun()
 
-else:
-    st.info("Add minimum 10 live results after training.")
-
-# ---------------------- HISTORY ----------------------
+# -------------------------------- HISTORY ---------------------------------
 if st.session_state.log:
-    st.subheader("📊 Prediction History")
+    st.subheader("📊 Prediction Log")
     df = pd.DataFrame(st.session_state.log)
     st.dataframe(df)
 
-    buf = BytesIO(); df.to_excel(buf, index=False)
-    st.download_button("Download Report 📥", buf.getvalue(), "history.xlsx")
+    if st.button("⬇ Download history"):
+        bio = BytesIO()
+        df.to_excel(bio, index=False)
+        st.download_button("Download Excel", bio.getvalue(),"history.xlsx")
