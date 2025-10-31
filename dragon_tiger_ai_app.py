@@ -1,669 +1,387 @@
-#!/usr/bin/env python3
-"""
-telegram_dragon_tiger_bot.py
-
-Hybrid Dragon-Tiger predictor with Telegram bot interface,
-hybrid models (XGBoost + LSTM ensemble), Markov/streak pattern logic,
-auto daily retrain, continuous learning from user-confirmed results.
-
-Configuration: set TELEGRAM_TOKEN (env var) or edit TELEGRAM_TOKEN below.
-Place a CSV file with historical results (column name 'result') next to this script.
-
-Author: Generated (adapt before production)
-"""
-
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import random
+from collections import defaultdict, Counter, deque
+from io import BytesIO
+import joblib
 import os
 import time
-import threading
-import traceback
-import joblib
-from datetime import datetime
-from functools import wraps
-from collections import defaultdict, Counter
-from io import BytesIO
 
-# Machine learning / DL
-import numpy as np
-import pandas as pd
-
-# XGBoost / sklearn
+# Try xgboost, fallback to RandomForestClassifier
+USE_XGBOOST = False
 try:
-    from xgboost import XGBClassifier, DMatrix, Booster
+    from xgboost import XGBClassifier
     USE_XGBOOST = True
 except Exception:
     from sklearn.ensemble import RandomForestClassifier
-    USE_XGBOOST = False
 
-# TensorFlow
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Model, load_model
-    from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Bidirectional, GRU, Concatenate
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.callbacks import EarlyStopping
-    USE_TF = True
-except Exception:
-    USE_TF = False
+# basic page setup
+st.set_page_config(page_title="🐉⚖️🌟 Dragon Tiger AI", layout="centered")
+st.title("🐉 Dragon vs 🌟 Tiger Predictor (AI Powered)")
 
-# Telegram bot
-from telegram import Update, ParseMode
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+st.markdown(
+    """
+    <style>
+        body { background-color: #0f1117; color: #ffffff; }
+        .stButton>button {
+            background-color: #9c27b0;
+            color: white;
+            font-weight: bold;
+        }
+        .stDownloadButton>button {
+            background-color: #1976d2;
+            color: white;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# Scheduler for daily retrain
-from apscheduler.schedulers.background import BackgroundScheduler
+# --- Session State initialization ---
+if "inputs" not in st.session_state:
+    st.session_state.inputs = []                # full sequence of rounds (strings 'D','T','TIE')
+if "X_train" not in st.session_state:
+    st.session_state.X_train = []               # list of feature vectors
+if "y_train" not in st.session_state:
+    st.session_state.y_train = []               # list of labels encoded 0/1/2
+if "log" not in st.session_state:
+    st.session_state.log = []                   # prediction history logs
+if "loss_streak" not in st.session_state:
+    st.session_state.loss_streak = 0
+if "markov" not in st.session_state:
+    st.session_state.markov = defaultdict(lambda: defaultdict(int))
+if "model" not in st.session_state:
+    st.session_state.model = None
+if "last_trained" not in st.session_state:
+    st.session_state.last_trained = None
 
-# ---------------------------
-# CONFIG (edit / override via env vars)
-# ---------------------------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "7899395894:AAFD7G9y9qnj7QiCfrjrXi8JMcbO1q4Q33M")
-CSV_PATH = os.environ.get("CSV_PATH", "D_vs_T_results.csv")
-CSV_COLUMN = os.environ.get("CSV_COLUMN", "result")  # column name inside CSV
-MODELS_DIR = os.environ.get("MODELS_DIR", "models")
-CONTEXT_LEN = int(os.environ.get("CONTEXT_LEN", 12))  # 10..20 recommended
-AUTO_RETRAIN_HOUR = int(os.environ.get("AUTO_RETRAIN_HOUR", 3))  # daily retrain hour (0-23)
-MIN_SK_TRAIN = int(os.environ.get("MIN_SK_TRAIN", 30))
-MIN_TF_TRAIN = int(os.environ.get("MIN_TF_TRAIN", 80))
-
-# Create models dir
-os.makedirs(MODELS_DIR, exist_ok=True)
-
-# ---------------------------
-# Utilities
-# ---------------------------
-LABEL_MAP = {"D": 0, "T": 1, "TIE": 2}
+# Encoding helpers
+LABEL_MAP = {'D': 0, 'T': 1, 'TIE': 2}
 INV_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
 
 def encode_label(s):
-    return LABEL_MAP.get(s.upper(), 2)
+    return LABEL_MAP.get(s, -1)
 
 def decode_label(i):
-    return INV_LABEL_MAP.get(int(i), "TIE")
+    return INV_LABEL_MAP.get(i, "")
 
-def safe_print(*args, **kwargs):
-    print(datetime.utcnow().isoformat(), *args, **kwargs)
-
-# decorator for handlers to catch exceptions
-def handler_safe(func):
-    @wraps(func)
-    def wrapper(update: Update, context: CallbackContext):
-        try:
-            return func(update, context)
-        except Exception as e:
-            safe_print("Handler error:", e)
-            safe_print(traceback.format_exc())
-            update.message.reply_text("⚠️ An internal error occurred. Check logs.")
-    return wrapper
-
-# ---------------------------
-# Data and Pattern Store
-# ---------------------------
-class DataStore:
-    def __init__(self):
-        self.history = []          # list of 'D','T','TIE' (strings)
-        self.X_eng = []            # list of engineered features
-        self.y = []                # labels (ints)
-        self.seq = []              # sequence arrays (timesteps,1)
-        self.markov = defaultdict(lambda: defaultdict(int))
-        # models
-        self.sk_model = None       # XGBoost or RandomForest
-        self.tf_models = {}        # dict: 'lstm','bilstm','gru'
-        # recent performance
-        self.recent_accuracy = {"sk": 0.5, "tf": 0.5}
-        # meta
-        self.last_trained = None
-        self.lock = threading.RLock()
-
-    def save(self):
-        # persist models & arrays
-        try:
-            joblib.dump(self.history, os.path.join(MODELS_DIR, "history.pkl"))
-            joblib.dump(self.X_eng, os.path.join(MODELS_DIR, "X_eng.pkl"))
-            joblib.dump(self.y, os.path.join(MODELS_DIR, "y.pkl"))
-            joblib.dump(dict(self.markov), os.path.join(MODELS_DIR, "markov.pkl"))
-            if self.sk_model is not None:
-                if USE_XGBOOST and hasattr(self.sk_model, "save_model"):
-                    self.sk_model.save_model(os.path.join(MODELS_DIR, "sk_model.xgb"))
-                else:
-                    joblib.dump(self.sk_model, os.path.join(MODELS_DIR, "sk_model.joblib"))
-            if USE_TF and self.tf_models:
-                for k, m in self.tf_models.items():
-                    try:
-                        m.save(os.path.join(MODELS_DIR, f"tf_{k}.keras"), include_optimizer=False)
-                    except Exception:
-                        safe_print("Failed to save TF model", k)
-            safe_print("Saved models & data.")
-        except Exception as e:
-            safe_print("Save failed:", e)
-
-    def load(self):
-        try:
-            if os.path.exists(os.path.join(MODELS_DIR, "history.pkl")):
-                self.history = joblib.load(os.path.join(MODELS_DIR, "history.pkl"))
-            if os.path.exists(os.path.join(MODELS_DIR, "X_eng.pkl")):
-                self.X_eng = joblib.load(os.path.join(MODELS_DIR, "X_eng.pkl"))
-            if os.path.exists(os.path.join(MODELS_DIR, "y.pkl")):
-                self.y = joblib.load(os.path.join(MODELS_DIR, "y.pkl"))
-            if os.path.exists(os.path.join(MODELS_DIR, "markov.pkl")):
-                m = joblib.load(os.path.join(MODELS_DIR, "markov.pkl"))
-                self.markov = defaultdict(lambda: defaultdict(int), m)
-            if USE_XGBOOST and os.path.exists(os.path.join(MODELS_DIR, "sk_model.xgb")):
-                b = Booster()
-                b.load_model(os.path.join(MODELS_DIR, "sk_model.xgb"))
-                self.sk_model = b
-            elif os.path.exists(os.path.join(MODELS_DIR, "sk_model.joblib")):
-                self.sk_model = joblib.load(os.path.join(MODELS_DIR, "sk_model.joblib"))
-            if USE_TF:
-                for name in ["lstm", "bilstm", "gru"]:
-                    p = os.path.join(MODELS_DIR, f"tf_{name}.keras")
-                    if os.path.exists(p):
-                        try:
-                            self.tf_models[name] = load_model(p, compile=False)
-                        except Exception:
-                            safe_print("Failed load TF model:", name)
-            safe_print("Loaded models & data (if present).")
-        except Exception as e:
-            safe_print("Load error:", e)
-
-DATA = DataStore()
-
-# ---------------------------
-# Feature builders & models
-# ---------------------------
-def build_engineered_features(history, context_len=CONTEXT_LEN):
-    N = context_len
-    lastN = history[-N:]
-    if len(lastN) < N:
-        lastN = ["TIE"]*(N - len(lastN)) + lastN
-    enc = [LABEL_MAP.get(x, 2) for x in lastN]
-    c = Counter(lastN)
-    count_D = c.get('D', 0); count_T = c.get('T', 0); count_TIE = c.get('TIE', 0)
-    last_winner = LABEL_MAP.get(lastN[-1], 2)
+# Feature builder
+def build_features(history_last_n):
+    """
+    history_last_n: list of last 10 outcomes strings, e.g. ['D','T',...]
+    returns: numeric feature vector (1D)
+    Features included:
+      - encoded last 10 (as ints)
+      - count_D, count_T, count_TIE (3)
+      - last_winner (0/1/2)
+      - last_streak_length (int)
+      - proportion_D_in_last10, proportion_T_in_last10
+    Total length = 10 + 3 + 1 + 1 + 2 = 17
+    """
+    last10 = history_last_n[-10:]
+    encoded = [LABEL_MAP.get(x, 2) for x in last10]  # default map
+    c = Counter(last10)
+    count_D = c.get('D', 0)
+    count_T = c.get('T', 0)
+    count_TIE = c.get('TIE', 0)
+    last_winner = LABEL_MAP.get(last10[-1], 2)
+    # compute last streak length
     streak_len = 1
-    for i in range(len(lastN)-2, -1, -1):
-        if lastN[i] == lastN[-1]:
+    for i in range(len(last10)-2, -1, -1):
+        if last10[i] == last10[-1]:
             streak_len += 1
         else:
             break
-    prop_D = count_D / N
-    prop_T = count_T / N
-    features = np.array(enc + [count_D, count_T, count_TIE, last_winner, streak_len, prop_D, prop_T], dtype=float)
-    return features
+    prop_D = count_D / len(last10)
+    prop_T = count_T / len(last10)
+    features = encoded + [count_D, count_T, count_TIE, last_winner, streak_len, prop_D, prop_T]
+    return np.array(features, dtype=float)
 
-def build_sequence_input(history, context_len=CONTEXT_LEN):
-    N = context_len
-    lastN = history[-N:]
-    if len(lastN) < N:
-        lastN = ["TIE"]*(N - len(lastN)) + lastN
-    seq = np.array([LABEL_MAP.get(x, 2) for x in lastN], dtype=float)
-    seq = seq.reshape(N, 1) / 2.0
-    return seq
+# Build training rows from current inputs (used when user adds)
+def add_training_from_inputs():
+    inputs = st.session_state.inputs
+    # For i starting from 10 -> len(inputs)-1, create features from i-10..i-1 and label inputs[i]
+    for i in range(10, len(inputs)):
+        history_slice = inputs[i-10:i]
+        result = inputs[i]
+        # create feature vector
+        f = build_features(history_slice)
+        # avoid duplicates: a simple rule is to append all; duplicates OK for model
+        st.session_state.X_train.append(f)
+        st.session_state.y_train.append(encode_label(result))
+        # update markov counts
+        for l in range(10, 4, -1):
+            if len(inputs[:i]) >= l:
+                key = tuple(inputs[i-l:i])
+                st.session_state.markov[key][result] += 1
 
-# TF model factory
-def build_seq_model(model_type, timesteps=CONTEXT_LEN, eng_dim=None, lr=0.001):
-    if not USE_TF:
-        raise RuntimeError("TensorFlow not available")
-    if eng_dim is None:
-        raise ValueError("eng_dim required")
-    inp = Input(shape=(timesteps, 1), name="seq_in")
-    eng_in = Input(shape=(eng_dim,), name="eng_in")
-    if model_type == "lstm":
-        x = LSTM(64, return_sequences=True)(inp)
-        x = LSTM(32, return_sequences=False)(x)
-    elif model_type == "bilstm":
-        x = Bidirectional(LSTM(64, return_sequences=True))(inp)
-        x = Bidirectional(LSTM(32, return_sequences=False))(x)
-    elif model_type == "gru":
-        x = GRU(64, return_sequences=True)(inp)
-        x = GRU(32, return_sequences=False)(x)
+# Train / (re)fit model function
+def train_model(force=False):
+    if len(st.session_state.X_train) < 40 and not force:
+        # require more patterns for stable training
+        return False, "Need at least 40 training examples to train the model."
+    X = np.vstack(st.session_state.X_train)
+    y = np.array(st.session_state.y_train)
+    # sample weighting: give more weight to recent examples
+    weights = np.linspace(1.0, 3.0, len(y))
+    if USE_XGBOOST:
+        model = XGBClassifier(
+            n_estimators=300,
+            learning_rate=0.04,
+            max_depth=4,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            use_label_encoder=False,
+            eval_metric="mlogloss",
+            verbosity=0,
+            random_state=42
+        )
     else:
-        x = LSTM(64, return_sequences=False)(inp)
-    x = Dropout(0.2)(x)
-    combined = Concatenate()([x, eng_in])
-    h = Dense(64, activation="relu")(combined)
-    h = Dropout(0.2)(h)
-    out = Dense(3, activation="softmax")(h)
-    model = Model([inp, eng_in], out)
-    model.compile(optimizer=Adam(lr), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-    return model
+        model = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=8,
+            class_weight="balanced_subsample",
+            random_state=42
+        )
+    model.fit(X, y, sample_weight=weights) if USE_XGBOOST else model.fit(X, y)
+    st.session_state.model = model
+    st.session_state.last_trained = time.time()
+    return True, "Model trained."
 
-# ---------------------------
-# Training Routines
-# ---------------------------
-def rebuild_training_from_history(context_len=CONTEXT_LEN):
-    with DATA.lock:
-        X_eng = []
-        seqs = []
-        y = []
-        for i in range(context_len, len(DATA.history)):
-            hist_slice = DATA.history[i-context_len:i]
-            X_eng.append(build_engineered_features(hist_slice, context_len))
-            seqs.append(build_sequence_input(hist_slice, context_len))
-            y.append(encode_label(DATA.history[i]))
-        if X_eng:
-            return np.vstack(X_eng), np.stack(seqs), np.array(y)
-        return None, None, None
-
-def train_sk_model(force=False):
-    """Train XGBoost (or RandomForest fallback) on engineered features."""
-    X_eng, seqs, y = rebuild_training_from_history(CONTEXT_LEN)
-    if X_eng is None:
-        return False, "No training data"
-    if len(X_eng) < MIN_SK_TRAIN and not force:
-        return False, f"Need >= {MIN_SK_TRAIN} samples for SK training"
-    try:
-        if USE_XGBOOST:
-            model = XGBClassifier(n_estimators=300, learning_rate=0.04, max_depth=4, subsample=0.85, colsample_bytree=0.85, use_label_encoder=False, eval_metric='mlogloss', verbosity=0)
-            model.fit(X_eng, y)
-        else:
-            model = RandomForestClassifier(n_estimators=300, max_depth=8, class_weight="balanced_subsample", random_state=42)
-            model.fit(X_eng, y)
-        with DATA.lock:
-            DATA.sk_model = model
-        # quick holdout accuracy
-        try:
-            Xtr, Xv, ytr, yv = train_test_split(X_eng, y, test_size=0.12, random_state=42, stratify=y if len(np.unique(y))>1 else None)
-            if USE_XGBOOST:
-                preds = np.argmax(model.predict_proba(Xv), axis=1) if hasattr(model, "predict_proba") else np.argmax(model.predict(DMatrix(Xv)), axis=1)
-            else:
-                preds = model.predict(Xv)
-            acc = float(np.mean(preds == yv))
-            DATA.recent_accuracy["sk"] = acc
-        except Exception:
-            pass
-        DATA.last_trained = time.time()
-        return True, "SK model trained"
-    except Exception as e:
-        safe_print("SK train error:", e)
-        return False, str(e)
-
-def train_tf_ensemble(force=False, epochs=15, batch_size=32):
-    """Train TF ensemble (LSTM/BiLSTM/GRU). This is heavier and may take time."""
-    if not USE_TF:
-        return False, "TensorFlow not installed"
-    X_eng, seqs, y = rebuild_training_from_history(CONTEXT_LEN)
-    if seqs is None:
-        return False, "No training data"
-    if len(seqs) < MIN_TF_TRAIN and not force:
-        return False, f"Need >= {MIN_TF_TRAIN} sequence samples for TF"
-    try:
-        timesteps = seqs.shape[1]
-        eng_dim = X_eng.shape[1]
-        Xs_train, Xs_val, Xe_train, Xe_val, y_train, y_val = train_test_split(seqs, X_eng, y, test_size=0.12, random_state=42, stratify=y if len(np.unique(y))>1 else None)
-        models = {}
-        for mtype in ["lstm", "bilstm", "gru"]:
-            m = build_seq_model(mtype, timesteps, eng_dim)
-            es = EarlyStopping(monitor="val_loss", patience=4, restore_best_weights=True)
-            m.fit({"seq_in": Xs_train, "eng_in": Xe_train}, y_train, validation_data=({"seq_in": Xs_val, "eng_in": Xe_val}, y_val), epochs=epochs, batch_size=batch_size, callbacks=[es], verbose=0)
-            # measure val acc
-            try:
-                p = m.predict({"seq_in": Xs_val, "eng_in": Xe_val}, verbose=0)
-                acc = float(np.mean(np.argmax(p, axis=1) == y_val))
-                DATA.recent_accuracy["tf"] = max(DATA.recent_accuracy.get("tf", 0.5), acc)
-            except Exception:
-                pass
-            models[mtype] = m
-        with DATA.lock:
-            DATA.tf_models = models
-        DATA.last_trained = time.time()
-        return True, "TF ensemble trained"
-    except Exception as e:
-        safe_print("TF train error:", e)
-        return False, str(e)
-
-# ---------------------------
-# Prediction: ensemble + heuristics
-# ---------------------------
-def markov_proba(last_seq):
-    for l in range(len(last_seq), 4, -1):
-        key = tuple(last_seq[-l:])
-        counts = DATA.markov.get(key, {})
-        if counts:
-            total = sum(counts.values())
-            return np.array([counts.get("D",0)/total, counts.get("T",0)/total, counts.get("TIE",0)/total])
-    return None
-
-def streak_bias_rule(last_seq):
-    c = Counter(last_seq)
-    N = len(last_seq)
-    thr = max(3, int(0.6 * N))
-    if c.get("D", 0) >= thr:
-        return "T", 64
-    if c.get("T", 0) >= thr:
-        return "D", 64
+# Predict function uses model + simple streak-bias fallback
+def streak_bias_rule(last10):
+    # if extreme streaks present, bias to opposite (simple heuristic)
+    c = Counter(last10)
+    if c.get('D', 0) >= 7:
+        return 'T', 64
+    if c.get('T', 0) >= 7:
+        return 'D', 64
     return None, 0
 
-def ensemble_predict(context_len=CONTEXT_LEN, weights=None):
-    with DATA.lock:
-        hist = list(DATA.history)
-        sk_model = DATA.sk_model
-        tf_models = dict(DATA.tf_models)
-    if len(hist) < context_len:
-        return None, 0, "need_more"
-    lastN = hist[-context_len:]
-    eng_feat = build_engineered_features(lastN, context_len).reshape(1, -1)
-    seq_feat = build_sequence_input(lastN, context_len).reshape(1, context_len, 1)
-    probs_tf = None
-    if tf_models:
-        arr = []
-        for m in tf_models.values():
-            try:
-                p = m.predict({"seq_in": seq_feat, "eng_in": eng_feat}, verbose=0)[0]
-                arr.append(p)
-            except Exception:
-                pass
-        if arr:
-            probs_tf = np.mean(arr, axis=0)
-    probs_sk = None
-    if sk_model is not None:
-        try:
-            if USE_XGBOOST and isinstance(sk_model, Booster):
-                dm = DMatrix(eng_feat)
-                probs_sk = sk_model.predict(dm)[0]
-            elif USE_XGBOOST:
-                probs_sk = sk_model.predict_proba(eng_feat)[0]
+def markov_proba(last_k):
+    # return distribution from stored markov counts for the best matching key
+    # try longest matching key first
+    for l in range(len(last_k), 4, -1):
+        key = tuple(last_k[-l:])
+        counts = st.session_state.markov.get(key, {})
+        if counts:
+            total = sum(counts.values())
+            probs = {k: v/total for k, v in counts.items()}
+            # return probabilities as list in order [D,T,TIE]
+            return [probs.get('D',0), probs.get('T',0), probs.get('TIE',0)]
+    return None
+
+def predict_now():
+    inputs = st.session_state.inputs
+    if len(inputs) < 10:
+        return None, 0, "Need 10 rounds"
+    # If model exists use it, otherwise fallback
+    last10 = inputs[-10:]
+    # check simple streak bias first
+    bias_pred, bias_conf = streak_bias_rule(last10)
+    # build features
+    feat = build_features(last10).reshape(1, -1)
+    # If we have a trained model:
+    if st.session_state.model is not None:
+        proba = st.session_state.model.predict_proba(feat)[0]
+        pred_idx = int(np.argmax(proba))
+        pred_label = decode_label(pred_idx)
+        conf = float(np.max(proba)) * 100
+        # incorporate markov info if available (weighted avg)
+        markov_p = markov_proba(last10)
+        if markov_p is not None:
+            # combine model proba and markov with weights (70% model, 30% markov)
+            combined = 0.7 * proba + 0.3 * np.array(markov_p)
+            pred_idx = int(np.argmax(combined))
+            pred_label = decode_label(pred_idx)
+            conf = float(np.max(combined)) * 100
+        # if model low confidence, use streak bias if exists
+        if conf < 65 and bias_pred:
+            return bias_pred, bias_conf, "streak-bias"
+        return pred_label, round(conf), "model"
+    else:
+        # no model: if we have markov, use it; else fallback to frequency
+        markov_p = markov_proba(last10)
+        if markov_p is not None:
+            idx = int(np.argmax(markov_p))
+            return decode_label(idx), int(max(markov_p)*100), "markov"
+        # fallback frequency
+        counts = Counter(last10)
+        best = counts.most_common(1)[0][0]
+        return best, 55, "frequency"
+
+# --- Input UI ---
+st.subheader("🎮 Add Result (D / T / TIE)")
+choice = st.selectbox("Choose Result", ["D", "T", "TIE"])
+if st.button("Add Result"):
+    st.session_state.inputs.append(choice)
+    st.success(f"Added: {choice}")
+    # add new train rows if possible
+    if len(st.session_state.inputs) > 10:
+        # just add the last training point to avoid re-adding everything repeatedly
+        i = len(st.session_state.inputs) - 1
+        if i >= 10:
+            history_slice = st.session_state.inputs[i-10:i]
+            result = st.session_state.inputs[i]
+            st.session_state.X_train.append(build_features(history_slice))
+            st.session_state.y_train.append(encode_label(result))
+            # update markov
+            for l in range(10, 4, -1):
+                if len(st.session_state.inputs[:i]) >= l:
+                    key = tuple(st.session_state.inputs[i-l:i])
+                    st.session_state.markov[key][result] += 1
+
+# --- Bulk add example / randomize (developer helper) ---
+with st.expander("Developer tools (Generate sample/random data)", expanded=False):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Add 10 random rounds"):
+            for _ in range(10):
+                st.session_state.inputs.append(random.choice(["D","T","TIE"]))
+            st.success("Added 10 random rounds.")
+    with col2:
+        if st.button("Clear inputs"):
+            st.session_state.inputs = []
+            st.session_state.X_train = []
+            st.session_state.y_train = []
+            st.session_state.log = []
+            st.session_state.markov = defaultdict(lambda: defaultdict(int))
+            st.session_state.model = None
+            st.success("Cleared all data.")
+    with col3:
+        if st.button("Force retrain (if enough data)"):
+            ok, msg = train_model(force=True)
+            if ok:
+                st.success(msg)
             else:
-                probs_sk = sk_model.predict_proba(eng_feat)[0]
-            probs_sk = np.array(probs_sk)
-        except Exception:
-            probs_sk = None
-    probs_markov = markov_proba(lastN)
-    bias_pred, bias_conf = streak_bias_rule(lastN)
-    # default dynamic weights
-    if weights is None:
-        w_tf = 0.5 if probs_tf is not None else 0.0
-        w_sk = 0.35 if probs_sk is not None else 0.0
-        w_mark = 0.15 if probs_markov is not None else 0.0
-        total = w_tf + w_sk + w_mark
-        if total == 0:
-            if bias_pred:
-                return bias_pred, bias_conf, "streak-bias"
-            cnt = Counter(lastN)
-            return cnt.most_common(1)[0][0], 55, "frequency"
-        w_tf /= total; w_sk /= total; w_mark /= total
-    else:
-        w_tf, w_sk, w_mark = weights
-    comps = []
-    total_w = 0.0
-    if probs_tf is not None:
-        comps.append((probs_tf, w_tf)); total_w += w_tf
-    if probs_sk is not None:
-        comps.append((probs_sk, w_sk)); total_w += w_sk
-    if probs_markov is not None:
-        comps.append((probs_markov, w_mark)); total_w += w_mark
-    if comps:
-        combined = np.zeros(3)
-        for p, w in comps:
-            combined += p * (w/total_w)
-        idx = int(np.argmax(combined))
-        conf = float(np.max(combined) * 100)
-        if conf < 60 and bias_pred:
-            return bias_pred, bias_conf, "streak-bias"
-        return decode_label(idx), round(conf), "ensemble"
-    else:
-        if bias_pred:
-            return bias_pred, bias_conf, "streak-bias"
-        cnt = Counter(lastN)
-        return cnt.most_common(1)[0][0], 55, "frequency"
+                st.warning(msg)
 
-# ---------------------------
-# Incremental online update
-# ---------------------------
-def online_learn(new_actual):
-    """
-    Called when the user confirms an actual outcome.
-    Adds to history and does a light online update:
-      - append engineered features and seq to training arrays
-      - update markov counts
-      - do one LSTM epoch on the single new sample (fast)
-      - retrain SK (fast) if enough new data (background thread)
-    """
-    with DATA.lock:
-        i = len(DATA.history)
-        # append training sample using last CONTEXT_LEN history (before appending actual)
-        if i >= CONTEXT_LEN:
-            hist_slice = DATA.history[i-CONTEXT_LEN:i]
-            DATA.X_eng.append(build_engineered_features(hist_slice, CONTEXT_LEN))
-            DATA.seq.append(build_sequence_input(hist_slice, CONTEXT_LEN))
-            DATA.y.append(encode_label(new_actual))
-            for l in range(CONTEXT_LEN, 4, -1):
-                if i >= l:
-                    key = tuple(DATA.history[i-l:i])
-                    DATA.markov[key][new_actual] += 1
-        DATA.history.append(new_actual)
+# --- Build training set from inputs if not already (first time) ---
+# (This will only run when we have unaccounted inputs and X_train is small)
+if len(st.session_state.X_train) < max(0, len(st.session_state.inputs) - 10):
+    add_training_from_inputs()
 
-    # light TF update: fit one epoch on the new sample if TF models exist
-    if USE_TF and DATA.tf_models:
-        try:
-            # prepare single-sample arrays
-            Xs = np.stack(DATA.seq[-1:])  # shape (1, timesteps, 1)
-            Xe = np.vstack(DATA.X_eng[-1:])
-            y = np.array([DATA.y[-1]])
-            for m in DATA.tf_models.values():
-                try:
-                    m.fit({"seq_in": Xs, "eng_in": Xe}, y, epochs=1, batch_size=1, verbose=0)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+# --- Show dataset counts and train button ---
+st.markdown("---")
+st.subheader("📊 Training Data & Model")
+st.text(f"Rounds recorded: {len(st.session_state.inputs)}")
+st.text(f"Training examples: {len(st.session_state.X_train)}")
+labels_preview = [decode_label(x) for x in st.session_state.y_train]
+st.text(f"Training Balance ➡️ D: {labels_preview.count('D')} | T: {labels_preview.count('T')} | TIE: {labels_preview.count('TIE')}")
 
-    # schedule SK retrain in background if enough data
-    def retrain_sk_bg():
-        ok, msg = train_sk_model(force=False)
-        safe_print("Auto SK retrain:", ok, msg)
-    # Fire background retrain if meeting conditions
-    if len(DATA.X_eng) >= MIN_SK_TRAIN:
-        t = threading.Thread(target=retrain_sk_bg, daemon=True)
-        t.start()
+col_a, col_b = st.columns(2)
+with col_a:
+    if st.button("Train Model"):
+        ok, msg = train_model(force=False)
+        if ok:
+            st.success(msg)
+        else:
+            st.warning(msg)
+with col_b:
+    if st.button("Save Model to disk"):
+        if st.session_state.model is None:
+            st.warning("No trained model to save.")
+        else:
+            os.makedirs("models", exist_ok=True)
+            joblib.dump(st.session_state.model, "models/dragon_tiger_model.joblib")
+            st.success("Model saved to models/dragon_tiger_model.joblib")
 
-# ---------------------------
-# CSV load & initial training
-# ---------------------------
-def load_csv_and_prepare(path=CSV_PATH, csv_column=CSV_COLUMN):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"CSV not found: {path}")
-    df = pd.read_csv(path)
-    if csv_column not in df.columns:
-        raise ValueError(f"CSV missing column '{csv_column}'")
-    # sanitize values to D/T/TIE uppercase
-    values = df[csv_column].astype(str).str.strip().str.upper().tolist()
-    values = [v if v in LABEL_MAP else "TIE" for v in values]
-    with DATA.lock:
-        DATA.history = values.copy()
-        # reset training arrays and build from history
-        DATA.X_eng = []; DATA.seq = []; DATA.y = []
-        for i in range(CONTEXT_LEN, len(DATA.history)):
-            hist_slice = DATA.history[i-CONTEXT_LEN:i]
-            DATA.X_eng.append(build_engineered_features(hist_slice, CONTEXT_LEN))
-            DATA.seq.append(build_sequence_input(hist_slice, CONTEXT_LEN))
-            DATA.y.append(encode_label(DATA.history[i]))
-            # markov update
-            for l in range(CONTEXT_LEN, 4, -1):
-                if i >= l:
-                    key = tuple(DATA.history[i-l:i])
-                    DATA.markov[key][DATA.history[i]] += 1
-    safe_print(f"Loaded CSV with {len(DATA.history)} rounds; training examples: {len(DATA.X_eng)}")
-    return True
+# Allow user to load saved model
+if os.path.exists("models/dragon_tiger_model.joblib"):
+    if st.button("Load saved model"):
+        st.session_state.model = joblib.load("models/dragon_tiger_model.joblib")
+        st.success("Loaded model from models/dragon_tiger_model.joblib")
 
-# ---------------------------
-# Scheduler (auto daily retrain)
-# ---------------------------
-scheduler = BackgroundScheduler()
-def daily_retrain_job():
-    safe_print("Daily retrain job started")
-    try:
-        ok, msg = train_sk_model(force=False)
-        safe_print("SK retrain:", ok, msg)
-        # TF retrain only if enough data
-        X_eng, seqs, y = rebuild_training_from_history(CONTEXT_LEN)
-        if USE_TF and seqs is not None and len(seqs) >= MIN_TF_TRAIN:
-            ok2, msg2 = train_tf_ensemble(force=False, epochs=20, batch_size=32)
-            safe_print("TF retrain:", ok2, msg2)
-    except Exception as e:
-        safe_print("Daily retrain error:", e)
-
-# schedule daily at configured hour
-scheduler.add_job(daily_retrain_job, 'cron', hour=AUTO_RETRAIN_HOUR)
-scheduler.start()
-
-# ---------------------------
-# Telegram bot handlers
-# ---------------------------
-
-@handler_safe
-def start_handler(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "🐉 Dragon-Tiger Bot\n"
-        "Commands:\n"
-        "/predict - predict next using recent history\n"
-        "/add <D/T/TIE> - add recent result (does NOT teach model until /confirm)\n"
-        "/confirm <D/T/TIE> - confirm actual result and teach model (online learning)\n"
-        "/history - show last 30 rounds\n"
-        "/status - show model status & training counts\n"
-        "/retrain - force retrain SK and (optionally) TF\n"
-        "/save - save models & data\n"
-        "/load - load models & data\n"
-    )
-
-@handler_safe
-def predict_handler(update: Update, context: CallbackContext):
-    pred, conf, src = ensemble_predict(CONTEXT_LEN)
+# --- Prediction Section ---
+st.markdown("---")
+st.subheader("🔮 Prediction")
+if len(st.session_state.inputs) < 10:
+    st.info(f"Enter {10 - len(st.session_state.inputs)} more inputs to begin prediction.")
+else:
+    pred, conf, source = predict_now()
+    # show debug info
+    st.text(f"Prediction source: {source}")
     if pred is None:
-        update.message.reply_text(f"Need {CONTEXT_LEN - len(DATA.history)} more rounds to predict.")
-        return
-    update.message.reply_text(f"🔮 Prediction: *{pred}*  Confidence: *{conf}%*  (source: {src})", parse_mode=ParseMode.MARKDOWN)
+        st.warning("Not enough data or model not trained.")
+    else:
+        if source == "model" and conf >= 65:
+            st.audio("https://actions.google.com/sounds/v1/cartoon/clang_and_wobble.ogg", autoplay=True)
+            st.subheader("🧠 AI Prediction")
+            st.success(f"Prediction: **{pred}** | Confidence: {conf}%")
+        elif source == "streak-bias":
+            st.warning("⚠️ Low model confidence — applying streak-bias heuristic.")
+            st.warning(f"Prediction (streak-bias): **{pred}** | Confidence: {conf}%")
+            st.audio("https://actions.google.com/sounds/v1/alarms/warning.ogg", autoplay=True)
+        else:
+            st.info(f"Prediction (fallback): **{pred}** | Confidence: {conf}%")
 
-@handler_safe
-def add_handler(update: Update, context: CallbackContext):
-    # /add D
-    args = context.args
-    if not args:
-        update.message.reply_text("Usage: /add D  or /add T  or /add TIE")
-        return
-    val = args[0].upper()
-    if val not in LABEL_MAP:
-        update.message.reply_text("Value must be one of D / T / TIE")
-        return
-    with DATA.lock:
-        DATA.history.append(val)
-        i = len(DATA.history) - 1
-        if i >= CONTEXT_LEN:
-            hist_slice = DATA.history[i-CONTEXT_LEN:i]
-            DATA.X_eng.append(build_engineered_features(hist_slice, CONTEXT_LEN))
-            DATA.seq.append(build_sequence_input(hist_slice, CONTEXT_LEN))
-            DATA.y.append(encode_label(DATA.history[i]))
-            for l in range(CONTEXT_LEN, 4, -1):
+        if st.session_state.loss_streak >= 3:
+            st.warning("⚠️ Multiple wrong predictions. Be cautious!")
+
+        # confirm & learn
+        actual = st.selectbox("Enter actual result", ["D", "T", "TIE"], key="confirm_actual")
+        if st.button("Confirm & Learn"):
+            correct = actual == pred
+            st.session_state.log.append({
+                "Prediction": pred,
+                "Confidence": conf,
+                "Source": source,
+                "Actual": actual,
+                "Correct": "✅" if correct else "❌",
+                "Timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            })
+            # add new training example using last 10 history (before actual appended)
+            if len(st.session_state.inputs) >= 10:
+                st.session_state.X_train.append(build_features(st.session_state.inputs[-10:]))
+                st.session_state.y_train.append(encode_label(actual))
+            # update markov counts
+            i = len(st.session_state.inputs)
+            for l in range(10, 4, -1):
                 if i >= l:
-                    key = tuple(DATA.history[i-l:i])
-                    DATA.markov[key][DATA.history[i]] += 1
-    update.message.reply_text(f"Added round: {val}. Current rounds: {len(DATA.history)}")
-    # optionally auto-retrain SK
-    if len(DATA.X_eng) >= MIN_SK_TRAIN:
-        t = threading.Thread(target=train_sk_model, kwargs={"force": False}, daemon=True)
-        t.start()
+                    key = tuple(st.session_state.inputs[i-l:i])
+                    st.session_state.markov[key][actual] += 1
+            # append actual to history
+            st.session_state.inputs.append(actual)
+            if correct:
+                st.session_state.loss_streak = 0
+            else:
+                st.session_state.loss_streak += 1
+            # optionally retrain automatically when enough new samples exist
+            if len(st.session_state.X_train) >= 60:
+                train_model()
+            st.experimental_rerun()
 
-@handler_safe
-def confirm_handler(update: Update, context: CallbackContext):
-    # /confirm D
-    args = context.args
-    if not args:
-        update.message.reply_text("Usage: /confirm D  or /confirm T  or /confirm TIE")
-        return
-    val = args[0].upper()
-    if val not in LABEL_MAP:
-        update.message.reply_text("Value must be one of D / T / TIE")
-        return
-    online_learn(val)
-    update.message.reply_text(f"Confirmed and learned: {val}. Total rounds: {len(DATA.history)}")
+# --- History & download ---
+st.markdown("---")
+st.subheader("📈 Prediction History")
+if st.session_state.log:
+    df = pd.DataFrame(st.session_state.log)
+    st.dataframe(df)
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Export History to Excel"):
+            buf = BytesIO()
+            df.to_excel(buf, index=False)
+            st.download_button("⬇️ Download Excel", data=buf.getvalue(), file_name="prediction_history.xlsx")
+    with col2:
+        if st.button("Export Training Set (CSV)"):
+            if st.session_state.X_train:
+                X = np.vstack(st.session_state.X_train)
+                y = np.array(st.session_state.y_train)
+                cols = [f"enc_{i+1}" for i in range(10)] + ["count_D","count_T","count_TIE","last_winner","streak_len","prop_D","prop_T"]
+                tr_df = pd.DataFrame(X, columns=cols)
+                tr_df["label"] = [decode_label(int(x)) for x in y]
+                buf = BytesIO()
+                tr_df.to_csv(buf, index=False)
+                st.download_button("⬇️ Download training CSV", data=buf.getvalue(), file_name="training_set.csv")
+            else:
+                st.warning("No training data to export.")
+else:
+    st.info("No prediction history yet.")
 
-@handler_safe
-def history_handler(update: Update, context: CallbackContext):
-    with DATA.lock:
-        last = DATA.history[-50:]
-    if not last:
-        update.message.reply_text("No history yet.")
-        return
-    # display as simple string
-    s = " ".join(last[-30:])
-    update.message.reply_text(f"Last rounds (most recent last):\n{ s }")
+# --- Footer ---
+st.markdown("---")
+st.caption("Built with ❤️ using Streamlit, XGBoost/RandomForest, and pattern learning. Tweak the training thresholds and hyperparameters in-app or in repo.")
 
-@handler_safe
-def status_handler(update: Update, context: CallbackContext):
-    with DATA.lock:
-        n_rounds = len(DATA.history)
-        n_train = len(DATA.X_eng)
-        sk = DATA.sk_model is not None
-        tf = bool(DATA.tf_models)
-    last_trained = datetime.utcfromtimestamp(DATA.last_trained).isoformat() if DATA.last_trained else "N/A"
-    msg = (
-        f"Rounds: {n_rounds}\n"
-        f"Training examples: {n_train}\n"
-        f"SK model: {'yes' if sk else 'no'}\n"
-        f"TF models: {'yes' if tf else 'no'}\n"
-        f"Recent acc (sk/tf): {DATA.recent_accuracy.get('sk',0):.2f} / {DATA.recent_accuracy.get('tf',0):.2f}\n"
-        f"Last trained: {last_trained}\n"
-        f"Context length: {CONTEXT_LEN}"
-    )
-    update.message.reply_text(msg)
-
-@handler_safe
-def retrain_handler(update: Update, context: CallbackContext):
-    update.message.reply_text("Starting retrain (SK fast, TF optional). This runs in background.")
-    def bg():
-        ok, msg = train_sk_model(force=True)
-        safe_print("Manual SK retrain:", ok, msg)
-        update.message.reply_text(f"SK retrain: {msg}")
-        # if user asked for TF in args or we have enough data, train TF
-        if ("tf" in context.args) or (USE_TF and len(DATA.seq) >= MIN_TF_TRAIN):
-            ok2, msg2 = train_tf_ensemble(force=True, epochs=20, batch_size=32)
-            safe_print("Manual TF retrain:", ok2, msg2)
-            update.message.reply_text(f"TF retrain: {msg2}")
-    threading.Thread(target=bg, daemon=True).start()
-
-@handler_safe
-def save_handler(update: Update, context: CallbackContext):
-    DATA.save()
-    update.message.reply_text("Saved models & data to models/")
-
-@handler_safe
-def load_handler(update: Update, context: CallbackContext):
-    DATA.load()
-    update.message.reply_text("Loaded models & data (if present).")
-
-# ---------------------------
-# Main bot start
-# ---------------------------
-def main():
-    # Load CSV data (if exists)
-    try:
-        if os.path.exists(CSV_PATH):
-            load_csv_and_prepare(CSV_PATH, CSV_COLUMN)
-    except Exception as e:
-        safe_print("CSV load error:", e)
-
-    # Start Telegram bot
-    if TELEGRAM_TOKEN is None or TELEGRAM_TOKEN.strip() == "" or TELEGRAM_TOKEN.startswith("<PUT"):
-        safe_print("ERROR: Set TELEGRAM_TOKEN env var or edit script.")
-        return
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", start_handler))
-    dp.add_handler(CommandHandler("predict", predict_handler))
-    dp.add_handler(CommandHandler("add", add_handler))
-    dp.add_handler(CommandHandler("confirm", confirm_handler))
-    dp.add_handler(CommandHandler("history", history_handler))
-    dp.add_handler(CommandHandler("status", status_handler))
-    dp.add_handler(CommandHandler("retrain", retrain_handler))
-    dp.add_handler(CommandHandler("save", save_handler))
-    dp.add_handler(CommandHandler("load", load_handler))
-    # fallback message handler
-    def echo(update, context):
-        update.message.reply_text("Use /predict, /add <D>, /confirm <D>, /history, /status, /retrain, /save, /load")
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, echo))
-
-    safe_print("Starting Telegram bot...")
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == "__main__":
-    main()
