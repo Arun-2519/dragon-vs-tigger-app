@@ -92,4 +92,33 @@ if file:
 
 # ✅ Live Input
 st.subheader("🎮 Add Live Result")
-choice = st.selectbox
+choice = st.selectbox("Select Result", ["D", "T", "TIE"])
+if st.button("Add Result"):
+    st.session_state.inputs.append(choice)
+    push_training(st.session_state.inputs[:-1], choice)
+    st.success(f"Added: {choice}")
+
+# ✅ Prediction
+if len(st.session_state.inputs) >= 10 and st.session_state.model_ready:
+    pred, conf = predict(st.session_state.inputs)
+
+    if pred:
+        if conf >= 65:
+            st.success(f"✅ Prediction: **{pred}** | Confidence: {conf}%")
+        else:
+            st.warning(f"⚠️ Low Confidence ({conf}%) — Continue input")
+    else:
+        st.info("💡 Keep adding data to start prediction.")
+
+# ✅ History
+if st.session_state.log:
+    st.subheader("📊 History")
+    df = pd.DataFrame(st.session_state.log)
+    st.dataframe(df)
+
+    if st.button("Download Log Excel"):
+        buf = BytesIO()
+        df.to_excel(buf, index=False)
+        st.download_button("⬇ Download", data=buf.getvalue(), file_name="history.xlsx")
+
+st.caption("⚡ Powered by Pattern AI + Naive Bayes")
