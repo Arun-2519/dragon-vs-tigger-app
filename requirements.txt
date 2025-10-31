@@ -1,5 +1,6 @@
-streamlit>=1.18
-pandas
+streamlit
 numpy
+pandas
 scikit-learn
-openpyxl
+joblib
+xgboost
