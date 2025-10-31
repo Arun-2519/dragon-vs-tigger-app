@@ -1,133 +1,111 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from collections import defaultdict
-from io import BytesIO
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score
+import joblib
 
-try:
-    from sklearn.naive_bayes import MultinomialNB
-except:
-    st.error("❌ scikit-learn is missing. Add to requirements.txt")
-    st.stop()
+st.set_page_config(page_title="Dragon vs Tiger AI", layout="centered")
 
-# -------------------------------- UI & STYLE -------------------------------
-st.set_page_config(page_title="🐉 Dragon vs 🌟 Tiger AI", layout="centered")
+# Result Encoder
+map_dict = {"D": 0, "T": 1, "DRAW": 2}
+reverse_map = {0: "D", 1: "T", 2: "DRAW"}
 
-st.markdown("""
-<style>
-body {background: #0A0F24; color: white;}
-.stButton>button {
-    background: linear-gradient(90deg,#9b27b0,#2196f3);
-    color:white;font-weight:bold;border-radius:12px;padding:10px 25px;
-}
-div[data-testid="stSelectbox"] label, h1, h2, h3, h4 {color:#20e3b2;}
-.dataframe {background:white !important;color:black;}
-</style>
-""", unsafe_allow_html=True)
+# Global storage
+session = st.session_state
 
-st.title("🐉 Dragon vs 🌟 Tiger — AI Predictor")
+if "model_trained" not in session:
+    session.model_trained = False
+if "live_results" not in session:
+    session.live_results = []
+if "lstm" not in session:
+    session.lstm = None
+if "xgb" not in session:
+    session.xgb = None
 
-# -------------------------------- STATE INIT -------------------------------
-if "inputs" not in st.session_state: st.session_state.inputs = []
-if "X_train" not in st.session_state: st.session_state.X_train = []
-if "y_train" not in st.session_state: st.session_state.y_train = []
-if "log" not in st.session_state: st.session_state.log = []
-if "loss_streak" not in st.session_state: st.session_state.loss_streak = 0
-if "csv_trained" not in st.session_state: st.session_state.csv_trained = False
+def prepare_sequences(data, seq_len=10):
+    X, y = [], []
+    for i in range(len(data) - seq_len):
+        X.append(data[i:i + seq_len])
+        y.append(data[i + seq_len])
+    return np.array(X), np.array(y)
 
-# -------------------------------- HELPERS ---------------------------------
-def encode(seq):
-    m = {"D":0, "T":1, "TIE":2}
-    return [m[s] for s in seq if s in m]
+def train_models(df):
+    data = df["Result"].map(map_dict).values
+    X, y = prepare_sequences(data, 10)
 
-def decode(v):
-    return {0:"D",1:"T",2:"TIE"}.get(v)
+    # LSTM shape
+    X_lstm = X.reshape((X.shape[0], X.shape[1], 1))
 
-def clean_results(series):
-    return series.astype(str).str.upper().str.strip().replace({
-        "DRAGON":"D","TIGER":"T","PLAYER":"D","BANKER":"T",
-        "DT":"TIE","DRAW":"TIE","TIG":"T","DRA":"D"
-    })
+    X_train, X_test, y_train, y_test = train_test_split(X_lstm, y, test_size=0.2, shuffle=False)
 
-def train_model(results):
-    results = [r for r in results if r in ["D","T","TIE"]]
-    if len(results) < 20: return
-    for i in range(10, len(results)):
-        seq = results[i-10:i]
-        st.session_state.X_train.append(encode(seq))
-        st.session_state.y_train.append(encode([results[i]])[0])
+    lstm = Sequential([
+        LSTM(64, input_shape=(10, 1)),
+        Dense(32, activation='relu'),
+        Dense(3, activation='softmax')
+    ])
+    lstm.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    lstm.fit(X_train, y_train, epochs=10, batch_size=16, verbose=0)
 
-def predict(seq):
-    if len(seq) < 10: return None, 0
-    if len(st.session_state.X_train) < 20: return None, 0
-    clf = MultinomialNB()
-    w = np.exp(np.linspace(0, 1, len(st.session_state.X_train)))
-    clf.fit(st.session_state.X_train, st.session_state.y_train, sample_weight=w)
-    p = clf.predict([encode(seq[-10:])])[0]
-    c = max(clf.predict_proba([encode(seq[-10:])])[0])*100
-    return decode(p), round(c,2)
+    lstm_acc = lstm.evaluate(X_test, y_test, verbose=0)[1]
 
-def learn_after_round(seq, actual):
-    if len(seq)>=10:
-        st.session_state.X_train.append(encode(seq[-10:]))
-        st.session_state.y_train.append(encode([actual])[0])
+    # XGB
+    X_xgb = X.reshape(len(X), 10)
+    X_train_x, X_test_x, y_train_x, y_test_x = train_test_split(X_xgb, y, test_size=0.2, shuffle=False)
+    xgb = XGBClassifier(n_estimators=200, learning_rate=0.05, max_depth=4)
+    xgb.fit(X_train_x, y_train_x)
+    y_pred = xgb.predict(X_test_x)
+    xgb_acc = accuracy_score(y_test_x, y_pred)
 
-# -------------------------------- CSV Upload -------------------------------
-st.subheader("📂 Upload History CSV")
-csv = st.file_uploader("Upload D vs T History (Period, Result)", type=["csv"])
+    return lstm, xgb, lstm_acc, xgb_acc
 
-if csv and not st.session_state.csv_trained:
-    data = pd.read_csv(csv)
-    
-    if "Result" not in data.columns:
-        st.error("❌ CSV must have a 'Result' column")
-        st.stop()
+def hybrid_predict(last10):
+    X = np.array(last10).reshape(1,10,1)
+    lstm_pred = session.lstm.predict(X, verbose=0)[0]
+    xgb_pred = session.xgb.predict(np.array(last10).reshape(1,10))[0]
 
-    results = clean_results(data["Result"]).tolist()
-    
-    train_model(results)
-    st.session_state.inputs = results[-20:]      # load last rounds to UI
-    st.session_state.csv_trained = True
-    st.success(f"✅ CSV Loaded & Trained on {len(results)} rounds")
+    lstm_choice = np.argmax(lstm_pred)
+    lstm_conf = lstm_pred[lstm_choice]
 
-# -------------------------------- USER INPUT -------------------------------
-st.subheader("🎮 Add Live Result")
+    if lstm_conf < 0.55: 
+        return xgb_pred, xgb_pred, 0.55
 
-choice = st.selectbox("Choose Result", ["D","T","TIE"])
+    return lstm_choice, xgb_pred, lstm_conf
 
-if st.button("➕ Add Result"):
-    st.session_state.inputs.append(choice)
-    st.success(f"✅ Added {choice}")
+st.header("🐉 Dragon vs 🐯 Tiger — Live AI Predictor")
 
-# -------------------------------- PREDICT ---------------------------------
-if len(st.session_state.inputs) >= 10:
-    pred, conf = predict(st.session_state.inputs)
+uploaded = st.file_uploader("Upload CSV (period, Result)", type=['csv'])
 
-    if not pred or conf < 55:
-        st.warning("⚠️ Collecting patterns... Low confidence")
-    else:
-        st.success(f"🧠 Prediction: **{pred}** | Confidence: {conf}%")
+if uploaded:
+    df = pd.read_csv(uploaded)
+    df["Result"] = df["Result"].astype(str).str.upper().str.strip()
 
-    # Confirm actual
-    actual = st.selectbox("Enter actual result", ["D","T","TIE"])
+    st.write("✅ CSV Loaded. Click train")
 
-    if st.button("✅ Confirm & Train"):
-        ok = (pred == actual)
-        st.session_state.log.append({
-            "Prediction":pred, "Confidence":conf,
-            "Actual":actual, "Correct":"✅" if ok else "❌"
-        })
-        learn_after_round(st.session_state.inputs, actual)
-        st.session_state.inputs.append(actual)
-        st.rerun()
+    if st.button("Train Model"):
+        session.lstm, session.xgb, lstm_acc, xgb_acc = train_models(df)
+        session.model_trained = True
+        
+        st.success(f"✅ Model Trained")
+        st.write(f"📈 LSTM Accuracy: **{lstm_acc:.2f}**")
+        st.write(f"📈 XGBoost Accuracy: **{xgb_acc:.2f}**")
 
-# -------------------------------- HISTORY ---------------------------------
-if st.session_state.log:
-    st.subheader("📊 Prediction Log")
-    df = pd.DataFrame(st.session_state.log)
-    st.dataframe(df)
+if session.model_trained:
+    st.subheader("Enter Live Game Results")
+    user_input = st.selectbox("Add result", ["", "D", "T", "DRAW"])
 
-    if st.button("⬇ Download history"):
-        bio = BytesIO()
-        df.to_excel(bio, index=False)
-        st.download_button("Download Excel", bio.getvalue(),"history.xlsx")
+    if st.button("Add Result") and user_input:
+        session.live_results.append(map_dict[user_input])
+
+    st.write("Recent:", [reverse_map[i] for i in session.live_results[-10:]])
+
+    if len(session.live_results) >= 10:
+        pred, backup, conf = hybrid_predict(session.live_results[-10:])
+        st.info(f"🧠 AI Predicts Next: **{reverse_map[pred]}** (confidence: {conf:.2f})")
+
+        if conf < 0.60:
+            st.warning("⚠️ Low confidence — continue entering results")
+
