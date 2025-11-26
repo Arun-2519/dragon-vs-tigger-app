@@ -1,115 +1,303 @@
-# lottery7_streamlit_nb_simple.py
-# Lightweight Lottery7 Wingo app (Markov + Frequency + pattern ensemble)
-# Uses the Dragon-Tiger example style for continuous learning. Reference: uploaded example. :contentReference[oaicite:1]{index=1}
+# lottery7_streamlit_deep.py
+"""
+Lottery7 Wingo — Streamlit app with incremental LSTM number & color models
+Minimal UI: 3 inputs per place (Size, Color, Number)
+"""
 
 import streamlit as st
 import numpy as np
 import pandas as pd
 import json, os, random
-from collections import defaultdict, deque
+from collections import deque
 from io import BytesIO
 
-# optional sklearn import for simple NB fallback (not required)
+# TensorFlow
 try:
-    from sklearn.naive_bayes import MultinomialNB
-    SKLEARN_AVAILABLE = True
-except Exception:
-    SKLEARN_AVAILABLE = False
+    import tensorflow as tf
+    from tensorflow.keras.models import Model
+    from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+except Exception as e:
+    st.error("TensorFlow is required. Install with `pip install tensorflow`.")
+    st.stop()
 
-st.set_page_config(page_title="🎯 Lottery7 Wingo — Simple Predictor", layout="centered")
-st.title("🎯 Lottery7 Wingo — Simple Predictor (Markov + Frequency)")
+# ----------------------
+# Config / rules
+# ----------------------
+st.set_page_config(page_title="Lottery7 Deep Predictor", layout="centered")
+st.title("🎯 Lottery7 Wingo — Deep LSTM Predictor (Minimal UI)")
 
-# ------------------------
-# Config & rules
-# ------------------------
-WINDOW = st.sidebar.number_input("Window (recent rounds)", value=10, min_value=3, max_value=30)
-CONF_THRESHOLD = st.sidebar.slider("Recommendation confidence %", 0, 100, 65)
-W_MARKOV = st.sidebar.slider("Weight: Markov", 0.0, 1.0, 0.6)
-W_FREQ = st.sidebar.slider("Weight: Freq", 0.0, 1.0, 0.3)
-W_PATTERN = st.sidebar.slider("Weight: RecentPattern", 0.0, 1.0, 0.1)
+DEFAULT_WINDOW = 10
+MODEL_NUM_PATH = "model_number.h5"
+MODEL_COL_PATH = "model_color.h5"
+HISTORY_PATH = "history_rules.json"
 
+# Sidebar hyperparameters
+st.sidebar.header("Hyperparameters")
+WINDOW = st.sidebar.number_input("Window length", value=DEFAULT_WINDOW, min_value=3, max_value=30)
+BATCH_SIZE = st.sidebar.number_input("Batch size", value=32)
+LR = float(st.sidebar.number_input("Learning rate", value=1e-4, format="%.6f"))
+INCREMENTAL_EPOCHS = st.sidebar.number_input("Epochs per update", value=1, min_value=1, max_value=5)
+CONF_THRESHOLD = st.sidebar.slider("Confidence threshold %", 0, 100, 65)
+
+# dims
 NUM_PLACES = 3
 NUM_CLASSES_NUM = 10
-NUM_CLASSES_COL = 3  # 0=G,1=R,2=V
-INV_COLOR = {0:'G',1:'R',2:'V'}
+NUM_CLASSES_COL = 3  # G=0, R=1, V=2
+FEATURES_PER_PLACE = NUM_CLASSES_NUM + NUM_CLASSES_COL + 1  # one-hot num + one-hot col + size bit
+INPUT_FEATURES = FEATURES_PER_PLACE * NUM_PLACES
 
+INV_COLOR = {0: 'G', 1: 'R', 2: 'V'}
 GREEN_NUMS = {1,3,7,9}
 RED_NUMS = {2,4,6,8}
 AMBIGUOUS_NUMS = {0,5}
 
-HISTORY_PATH = "history_rules.json"
+# ----------------------
+# Simple replay buffer
+# ----------------------
+class ReplayBuffer:
+    def __init__(self, maxlen=5000):
+        self.buff = deque(maxlen=maxlen)
+    def add(self, X, y_num, y_col):
+        # X: (window, features); y_num, y_col are dicts with keys num_0..num_2, col_0..col_2
+        self.buff.append((np.array(X, dtype=np.float32), {**y_num, **y_col}))
+    def sample(self, n):
+        n = min(n, len(self.buff))
+        if n == 0:
+            return np.zeros((0, WINDOW, INPUT_FEATURES), dtype=np.float32), {}
+        s = random.sample(list(self.buff), n)
+        X = np.stack([p[0] for p in s], axis=0)
+        keys = s[0][1].keys()
+        y = {k: np.array([p[1][k] for p in s], dtype=np.int32) for k in keys}
+        return X, y
+    def __len__(self):
+        return len(self.buff)
 
-# ------------------------
-# Helpers: Markov & Frequency
-# ------------------------
-class Markov:
-    def __init__(self, n):
-        self.n = n
-        # initialize uniform+1 smoothing
-        self.counts = np.ones((n, n), dtype=np.float32)
-    def update(self, prev, nxt):
-        self.counts[int(prev), int(nxt)] += 1
-    def predict(self, last):
-        row = self.counts[int(last)].astype(np.float32)
-        return row / row.sum()
+# ----------------------
+# Build models
+# ----------------------
+def build_number_model():
+    tf.keras.backend.clear_session()
+    inp = Input(shape=(WINDOW, INPUT_FEATURES), name='num_input')
+    x = LSTM(128, name='num_lstm')(inp)
+    x = Dropout(0.1)(x)
+    outs = [Dense(NUM_CLASSES_NUM, activation='softmax', name=f'num_{p}_out')(x) for p in range(NUM_PLACES)]
+    m = Model(inputs=inp, outputs=outs)
+    m.compile(optimizer=Adam(LR), loss=['sparse_categorical_crossentropy']*NUM_PLACES)
+    return m
 
-class Frequency:
-    def __init__(self, n):
-        self.counts = np.ones(n, dtype=np.float32)
-    def update(self, x):
-        self.counts[int(x)] += 1
-    def prob(self):
-        return self.counts / self.counts.sum()
+def build_color_model():
+    tf.keras.backend.clear_session()
+    inp = Input(shape=(WINDOW, INPUT_FEATURES), name='col_input')
+    x = LSTM(64, name='col_lstm')(inp)
+    x = Dropout(0.1)(x)
+    outs = [Dense(NUM_CLASSES_COL, activation='softmax', name=f'col_{p}_out')(x) for p in range(NUM_PLACES)]
+    m = Model(inputs=inp, outputs=outs)
+    m.compile(optimizer=Adam(LR), loss=['sparse_categorical_crossentropy']*NUM_PLACES)
+    return m
 
-# ------------------------
-# Session state / history
-# ------------------------
+# ----------------------
+# Session state init
+# ----------------------
 if 'history' not in st.session_state:
     if os.path.exists(HISTORY_PATH):
         try:
-            st.session_state.history = json.load(open(HISTORY_PATH,'r'))
+            st.session_state.history = json.load(open(HISTORY_PATH, 'r'))
         except Exception:
             st.session_state.history = []
     else:
         st.session_state.history = []
 
-# initialize priors
-if 'markov_num' not in st.session_state:
-    st.session_state.markov_num = [Markov(NUM_CLASSES_NUM) for _ in range(NUM_PLACES)]
+if 'replay' not in st.session_state:
+    st.session_state.replay = ReplayBuffer(maxlen=5000)
+
+if 'markov' not in st.session_state:
+    # simple Markov for numbers per place
+    st.session_state.markov = [np.ones((NUM_CLASSES_NUM, NUM_CLASSES_NUM), dtype=np.float32) for _ in range(NUM_PLACES)]
+
 if 'freq_num' not in st.session_state:
-    st.session_state.freq_num = [Frequency(NUM_CLASSES_NUM) for _ in range(NUM_PLACES)]
+    st.session_state.freq_num = [np.ones(NUM_CLASSES_NUM, dtype=np.float32) for _ in range(NUM_PLACES)]
+
 if 'freq_col' not in st.session_state:
-    st.session_state.freq_col = [Frequency(NUM_CLASSES_COL) for _ in range(NUM_PLACES)]
+    st.session_state.freq_col = [np.ones(NUM_CLASSES_COL, dtype=np.float32) for _ in range(NUM_PLACES)]
+
+if 'model_num' not in st.session_state:
+    if os.path.exists(MODEL_NUM_PATH):
+        try:
+            st.session_state.model_num = tf.keras.models.load_model(MODEL_NUM_PATH)
+            tf.keras.backend.set_value(st.session_state.model_num.optimizer.learning_rate, LR)
+        except Exception:
+            st.session_state.model_num = build_number_model()
+    else:
+        st.session_state.model_num = build_number_model()
+
+if 'model_col' not in st.session_state:
+    if os.path.exists(MODEL_COL_PATH):
+        try:
+            st.session_state.model_col = tf.keras.models.load_model(MODEL_COL_PATH)
+            tf.keras.backend.set_value(st.session_state.model_col.optimizer.learning_rate, LR)
+        except Exception:
+            st.session_state.model_col = build_color_model()
+    else:
+        st.session_state.model_col = build_color_model()
 
 if 'pending' not in st.session_state:
     st.session_state.pending = None
 if 'log' not in st.session_state:
     st.session_state.log = []
 
-# populate priors from existing history once
-if not st.session_state.get('_priors_populated', False):
+# populate replay from history if present (one-time)
+if not st.session_state.get('_populated', False):
     hist = st.session_state.history
+    for i in range(len(hist) - WINDOW):
+        win = hist[i:i+WINDOW]
+        Xw = [None]*WINDOW
+        for t_idx, t in enumerate(win):
+            vec = []
+            for p in range(NUM_PLACES):
+                n = int(t['places'][p]['num'])
+                c = int(t['places'][p]['color'])
+                nvec = np.zeros(NUM_CLASSES_NUM); nvec[n] = 1.0
+                cvec = np.zeros(NUM_CLASSES_COL); cvec[c] = 1.0
+                svec = np.array([1.0 if n >=5 else 0.0])
+                vec.extend(nvec.tolist()); vec.extend(cvec.tolist()); vec.extend(svec.tolist())
+            Xw[t_idx] = vec
+        target = hist[i+WINDOW]
+        y_num = {f'num_{p}_out': int(target['places'][p]['num']) for p in range(NUM_PLACES)}
+        y_col = {f'col_{p}_out': int(target['places'][p]['color']) for p in range(NUM_PLACES)}
+        st.session_state.replay.add(np.stack(Xw, axis=0), y_num, y_col)
+    # markov/freq
     for i in range(len(hist)-1):
         cur = hist[i]; nxt = hist[i+1]
         for p in range(NUM_PLACES):
-            st.session_state.markov_num[p].update(cur['places'][p]['num'], nxt['places'][p]['num'])
-            st.session_state.freq_num[p].update(nxt['places'][p]['num'])
-            st.session_state.freq_col[p].update(nxt['places'][p]['color'])
-    st.session_state._priors_populated = True
+            st.session_state.markov[p][cur['places'][p]['num'], nxt['places'][p]['num']] += 1
+            st.session_state.freq_num[p][nxt['places'][p]['num']] += 1
+            st.session_state.freq_col[p][nxt['places'][p]['color']] += 1
+    st.session_state._populated = True
 
-# ------------------------
-# Encoders + utils
-# ------------------------
+# ----------------------
+# Helpers
+# ----------------------
+def round_to_vector(round_entry):
+    vec = []
+    for p in range(NUM_PLACES):
+        n = int(round_entry['places'][p]['num'])
+        c = int(round_entry['places'][p]['color'])
+        nvec = np.zeros(NUM_CLASSES_NUM, dtype=np.float32); nvec[n] = 1.0
+        cvec = np.zeros(NUM_CLASSES_COL, dtype=np.float32); cvec[c] = 1.0
+        svec = np.array([1.0 if n >=5 else 0.0], dtype=np.float32)
+        vec.extend(nvec.tolist()); vec.extend(cvec.tolist()); vec.extend(svec.tolist())
+    return np.array(vec, dtype=np.float32)
+
 def save_history():
-    json.dump(st.session_state.history, open(HISTORY_PATH,'w'), indent=2)
+    with open(HISTORY_PATH, 'w') as f:
+        json.dump(st.session_state.history, f, indent=2)
 
-def round_to_display(r):
-    return ','.join([f"{p['num']}{INV_COLOR[p['color']]}{'B' if p.get('size_observed', p['num']>=5) else 'S'}" for p in r['places']])
+# ----------------------
+# Core incremental update
+# ----------------------
+def incremental_update_and_predict(new_round):
+    # append history & save
+    st.session_state.history.append(new_round)
+    save_history()
 
-# ------------------------
-# UI: Minimal 3 inputs per place
-# ------------------------
-st.subheader("Enter new round (Size, Color, Number) — minimal input")
+    # update markov/freq
+    if len(st.session_state.history) >= 2:
+        prev = st.session_state.history[-2]
+        cur = st.session_state.history[-1]
+        for p in range(NUM_PLACES):
+            st.session_state.markov[p][prev['places'][p]['num'], cur['places'][p]['num']] += 1
+            st.session_state.freq_num[p][cur['places'][p]['num']] += 1
+            st.session_state.freq_col[p][cur['places'][p]['color']] += 1
+
+    # add to replay buffer if possible
+    if len(st.session_state.history) >= WINDOW + 1:
+        window = st.session_state.history[-(WINDOW+1):-1]
+        Xw = [round_to_vector(t) for t in window]
+        target = st.session_state.history[-1]
+        y_num = {f'num_{p}_out': int(target['places'][p]['num']) for p in range(NUM_PLACES)}
+        y_col = {f'col_{p}_out': int(target['places'][p]['color']) for p in range(NUM_PLACES)}
+        st.session_state.replay.add(np.stack(Xw, axis=0), y_num, y_col)
+
+    # sample replay and incremental train
+    Xr, yr = st.session_state.replay.sample(min(256, len(st.session_state.replay)))
+    if Xr.shape[0] > 0:
+        try:
+            st.session_state.model_num.fit(Xr, [yr[f'num_{p}_out'] for p in range(NUM_PLACES)],
+                                          epochs=INCREMENTAL_EPOCHS, batch_size=max(8, BATCH_SIZE), verbose=0)
+        except Exception:
+            st.warning("Number model training failed; rebuilding model.")
+            st.session_state.model_num = build_number_model()
+
+        try:
+            st.session_state.model_col.fit(Xr, [yr[f'col_{p}_out'] for p in range(NUM_PLACES)],
+                                          epochs=INCREMENTAL_EPOCHS, batch_size=max(8, BATCH_SIZE), verbose=0)
+        except Exception:
+            st.warning("Color model training failed; rebuilding model.")
+            st.session_state.model_col = build_color_model()
+
+    # make prediction based on last WINDOW
+    if len(st.session_state.history) >= WINDOW:
+        inp = np.stack([round_to_vector(r) for r in st.session_state.history[-WINDOW:]], axis=0).reshape(1, WINDOW, INPUT_FEATURES)
+        preds_num = st.session_state.model_num.predict(inp, verbose=0)
+        preds_col = st.session_state.model_col.predict(inp, verbose=0)
+        num_probs = {f'num_{p}_out': preds_num[p][0] for p in range(NUM_PLACES)}
+        col_model_probs = {f'col_{p}_out': preds_col[p][0] for p in range(NUM_PLACES)}
+    else:
+        num_probs = {f'num_{p}_out': np.ones(NUM_CLASSES_NUM)/NUM_CLASSES_NUM for p in range(NUM_PLACES)}
+        col_model_probs = {f'col_{p}_out': np.ones(NUM_CLASSES_COL)/NUM_CLASSES_COL for p in range(NUM_PLACES)}
+
+    # derive colors & sizes from num_probs + color model for ambiguous numbers
+    color_final = {}
+    size_final = {}
+    for p in range(NUM_PLACES):
+        npb = num_probs[f'num_{p}_out']
+        probs = np.zeros(NUM_CLASSES_COL, dtype=np.float32)
+        for n in range(NUM_CLASSES_NUM):
+            pn = npb[n]
+            if n in GREEN_NUMS:
+                probs[0] += pn
+            elif n in RED_NUMS:
+                probs[1] += pn
+            elif n in AMBIGUOUS_NUMS:
+                cm = col_model_probs[f'col_{p}_out']
+                red_share = cm[1]; vio_share = cm[2]; total = (red_share + vio_share)
+                if total <= 0:
+                    probs[1] += pn*0.5; probs[2] += pn*0.5
+                else:
+                    probs[1] += pn * (red_share/total)
+                    probs[2] += pn * (vio_share/total)
+            else:
+                probs += pn / NUM_CLASSES_COL
+        if probs.sum() > 0:
+            probs = probs / probs.sum()
+        else:
+            probs = np.ones(NUM_CLASSES_COL)/NUM_CLASSES_COL
+        color_final[f'col_{p}_out'] = probs
+
+        # size from number probs
+        small_prob = np.sum(npb[0:5])
+        big_prob = np.sum(npb[5:10])
+        s = np.array([small_prob, big_prob], dtype=np.float32)
+        if s.sum() > 0:
+            s = s / s.sum()
+        else:
+            s = np.array([0.5,0.5])
+        size_final[f'size_{p}_out'] = s
+
+    # save models
+    try:
+        st.session_state.model_num.save(MODEL_NUM_PATH)
+        st.session_state.model_col.save(MODEL_COL_PATH)
+    except Exception:
+        pass
+
+    return num_probs, color_final, size_final
+
+# ----------------------
+# Minimal 3-input UI (S/B, Color, Number)
+# ----------------------
+st.subheader("Enter new round — three inputs per place")
 cols = st.columns(NUM_PLACES)
 place_inputs = []
 COLOR_CHOICES = ['G','R','V','R+V','G+V']
@@ -117,14 +305,13 @@ SIZE_CHOICES = ['S','B']
 
 for i in range(NUM_PLACES):
     with cols[i]:
-        st.markdown(f"**Place P{i+1}**")
-        size_choice = st.selectbox(f"P{i+1} Size", options=SIZE_CHOICES, index=0, key=f'size_in_{i}')
-        col_choice = st.selectbox(f"P{i+1} Color", options=COLOR_CHOICES, index=0, key=f'col_in_{i}')
+        st.markdown(f"Place P{i+1}")
+        size_choice = st.selectbox(f"P{i+1} Size (S/B)", options=SIZE_CHOICES, index=0, key=f'size_in_{i}')
+        color_choice = st.selectbox(f"P{i+1} Color", options=COLOR_CHOICES, index=0, key=f'col_in_{i}')
         num_choice = st.number_input(f"P{i+1} Number", min_value=0, max_value=9, value=0, key=f'num_in_{i}')
-        place_inputs.append({'num': int(num_choice), 'color_raw': col_choice, 'size_raw': size_choice})
+        place_inputs.append({'num': int(num_choice), 'color_raw': color_choice, 'size_raw': size_choice})
 
 if st.button("Queue round"):
-    # map color_raw -> primary int + ambiguous flag
     pending = {'places': []}
     for p in range(NUM_PLACES):
         n = place_inputs[p]['num']
@@ -155,182 +342,124 @@ if st.button("Queue round"):
     st.success("Queued round — confirm to learn")
 
 if st.session_state.pending:
-    st.info("Pending: " + round_to_display(st.session_state.pending))
+    # safe display using join and format (avoids nested f-string issues)
+    pending = st.session_state.pending
+    parts = []
+    for i in range(NUM_PLACES):
+        p = pending['places'][i]
+        size_label = 'B' if p['size_observed'] == 1 else 'S'
+        parts.append("{}:{}{}{}".format("P"+str(i+1), p['num'], p['color_raw'], size_label))
+    st.info("Pending: " + ", ".join(parts))
 
-# ------------------------
-# Prediction core (ensemble: Markov + Freq + Recent pattern)
-# ------------------------
-def predict_from_history():
-    hist = st.session_state.history
-    L = len(hist)
-    results = {}
-    if L < 1:
-        # return uniform defaults if no history
-        for p in range(NUM_PLACES):
-            results[p] = {
-                'num_probs': np.ones(NUM_CLASSES_NUM)/NUM_CLASSES_NUM,
-                'col_probs': np.ones(NUM_CLASSES_COL)/NUM_CLASSES_COL,
-                'size_probs': np.array([0.5,0.5])
-            }
-        return results
+# ----------------------
+# Live predictions
+# ----------------------
+st.subheader("Live prediction")
+if len(st.session_state.history) >= WINDOW:
+    # safe predict without try/except too many times
+    num_probs, col_probs, size_probs = incremental_update_and_predict({}) if False else (None, None, None)
+    # call prediction helper without adding new round - reuse incremental logic but not appending
+    # Use separate predict-only snippet:
+    inp_hist_len = len(st.session_state.history)
+    inp = np.stack([round_to_vector(r) for r in st.session_state.history[-WINDOW:]], axis=0).reshape(1, WINDOW, INPUT_FEATURES)
+    preds_num = st.session_state.model_num.predict(inp, verbose=0)
+    preds_col = st.session_state.model_col.predict(inp, verbose=0)
+    num_probs_live = {f'num_{p}_out': preds_num[p][0] for p in range(NUM_PLACES)}
+    col_model_live = {f'col_{p}_out': preds_col[p][0] for p in range(NUM_PLACES)}
 
-    # for each place compute ensemble
+    # derive final
+    color_live = {}
+    size_live = {}
     for p in range(NUM_PLACES):
-        # 1) Markov: use last observed number for that place if available
-        if L >= 1:
-            last_num = hist[-1]['places'][p]['num']
-            markov_prob = st.session_state.markov_num[p].predict(last_num)
-        else:
-            markov_prob = np.ones(NUM_CLASSES_NUM)/NUM_CLASSES_NUM
-
-        # 2) Frequency prior
-        freq_prob = st.session_state.freq_num[p].prob()
-
-        # 3) recent-window pattern: count occurrences of numbers in last WINDOW
-        recent_counts = np.ones(NUM_CLASSES_NUM, dtype=np.float32)  # smoothing
-        start = max(0, L - WINDOW)
-        for i in range(start, L):
-            val = hist[i]['places'][p]['num']
-            recent_counts[int(val)] += 1
-        recent_prob = recent_counts / recent_counts.sum()
-
-        # combine with weights (normalized)
-        w_total = W_MARKOV + W_FREQ + W_PATTERN
-        if w_total <= 0:
-            w_total = 1.0
-        combined_num = (W_MARKOV*markov_prob + W_FREQ*freq_prob + W_PATTERN*recent_prob) / w_total
-
-        # color: derive from numbers mostly. For ambiguous numbers (0,5) consult color frequency
-        col_probs = np.zeros(NUM_CLASSES_COL, dtype=np.float32)
-        # get color_model split from frequency for ambiguous case
-        color_freq = st.session_state.freq_col[p].prob()
+        npb = num_probs_live[f'num_{p}_out']
+        probs = np.zeros(NUM_CLASSES_COL, dtype=np.float32)
         for n in range(NUM_CLASSES_NUM):
-            pn = combined_num[n]
+            pn = npb[n]
             if n in GREEN_NUMS:
-                col_probs[0] += pn
+                probs[0] += pn
             elif n in RED_NUMS:
-                col_probs[1] += pn
+                probs[1] += pn
             elif n in AMBIGUOUS_NUMS:
-                # split ambiguous probability using color_freq's red/violet portion
-                red_share = color_freq[1]
-                vio_share = color_freq[2]
-                total = red_share + vio_share
+                cm = col_model_live[f'col_{p}_out']
+                red_share = cm[1]; vio_share = cm[2]; total = red_share + vio_share
                 if total <= 0:
-                    col_probs[1] += pn*0.5
-                    col_probs[2] += pn*0.5
+                    probs[1] += pn*0.5; probs[2] += pn*0.5
                 else:
-                    col_probs[1] += pn * (red_share/total)
-                    col_probs[2] += pn * (vio_share/total)
+                    probs[1] += pn * (red_share/total)
+                    probs[2] += pn * (vio_share/total)
             else:
-                col_probs += pn / NUM_CLASSES_COL
-        if col_probs.sum() > 0:
-            col_probs /= col_probs.sum()
+                probs += pn / NUM_CLASSES_COL
+        if probs.sum() > 0:
+            probs = probs / probs.sum()
         else:
-            col_probs = np.ones(NUM_CLASSES_COL)/NUM_CLASSES_COL
+            probs = np.ones(NUM_CLASSES_COL)/NUM_CLASSES_COL
+        color_live[f'col_{p}_out'] = probs
+        small_prob = np.sum(npb[0:5]); big_prob = np.sum(npb[5:10])
+        s = np.array([small_prob, big_prob]); s = s / s.sum() if s.sum()>0 else np.array([0.5,0.5])
+        size_live[f'size_{p}_out'] = s
 
-        # size derived deterministically from number probabilities
-        small_prob = combined_num[:5].sum()
-        big_prob = combined_num[5:].sum()
-        size_probs = np.array([small_prob, big_prob], dtype=np.float32)
-        if size_probs.sum() > 0:
-            size_probs = size_probs / size_probs.sum()
-        else:
-            size_probs = np.array([0.5,0.5])
-
-        results[p] = {
-            'num_probs': combined_num,
-            'col_probs': col_probs,
-            'size_probs': size_probs
-        }
-    return results
-
-# ------------------------
-# Live prediction UI
-# ------------------------
-st.subheader("Live prediction (based on current history)")
-if len(st.session_state.history) >= max(1, WINDOW//2):
-    preds = predict_from_history()
-    place_choice = st.selectbox('Select place to inspect / bet', options=['P1','P2','P3'])
+    place_choice = st.selectbox("Select place", options=["P1","P2","P3"])
     pi = int(place_choice[1]) - 1
-    num_probs = preds[pi]['num_probs']
-    col_probs = preds[pi]['col_probs']
-    size_probs = preds[pi]['size_probs']
+    pred_num = int(np.argmax(num_probs_live[f'num_{pi}_out'])); conf_num = float(np.max(num_probs_live[f'num_{pi}_out']))*100.0
+    pred_col_idx = int(np.argmax(color_live[f'col_{pi}_out'])); conf_col = float(np.max(color_live[f'col_{pi}_out']))*100.0
+    pred_size_idx = int(np.argmax(size_live[f'size_{pi}_out'])); conf_size = float(np.max(size_live[f'size_{pi}_out']))*100.0
 
-    pred_num = int(np.argmax(num_probs)); conf_num = float(np.max(num_probs))*100.0
-    pred_col = int(np.argmax(col_probs)); conf_col = float(np.max(col_probs))*100.0
-    pred_size_idx = int(np.argmax(size_probs)); conf_size = float(np.max(size_probs))*100.0
+    st.write("Prediction for {}:".format(place_choice))
+    st.write("- Number: {} (conf {:.1f}%)".format(pred_num, conf_num))
+    st.write("- Color: {} (conf {:.1f}%)".format(INV_COLOR[pred_col_idx], conf_col))
+    st.write("- Size: {} (conf {:.1f}%)".format('B' if pred_size_idx==1 else 'S', conf_size))
 
-    st.write(f"Place {place_choice} prediction:")
-    st.write(f"- Number: {pred_num} (conf {conf_num:.1f}%)")
-    st.write(f"- Color: {INV_COLOR[pred_col]} (conf {conf_col:.1f}%)")
-    st.write(f"- Size: {'B' if pred_size_idx==1 else 'S'} (conf {conf_size:.1f}%)")
-
-    # recommend best bet among Number/Color/Size
-    best_cat, best_val, best_conf = None, None, -1.0
-    for cat, val, conf in [
-        ('Number', pred_num, conf_num),
-        ('Color', INV_COLOR[pred_col], conf_col),
-        ('Size', 'B' if pred_size_idx==1 else 'S', conf_size)
-    ]:
+    # recommend highest confidence
+    best_cat = None; best_conf = -1.0; best_val = None
+    for cat, val, conf in [('Number', pred_num, conf_num), ('Color', INV_COLOR[pred_col_idx], conf_col), ('Size', 'B' if pred_size_idx==1 else 'S', conf_size)]:
         if conf > best_conf:
             best_conf = conf; best_cat = cat; best_val = val
-
     if best_conf >= CONF_THRESHOLD:
-        st.success(f"RECOMMENDED BET: {best_cat} -> {best_val} (confidence {best_conf:.1f}%)")
+        st.success("RECOMMENDED BET: {} -> {} (conf {:.1f}%)".format(best_cat, best_val, best_conf))
     else:
-        st.warning("WAIT: model confidence below threshold. Keep collecting results until pattern emerges.")
+        st.warning("WAIT: confidence below threshold ({:.1f}%).".format(best_conf))
 else:
     need = max(0, WINDOW - len(st.session_state.history))
-    st.info(f"Need {need} more rounds (history) to make reliable predictions.")
+    st.info("Need {} more rounds to start LSTM-based live predictions.".format(need))
 
-# ------------------------
+# ----------------------
 # Confirm & Learn
-# ------------------------
-st.subheader("Confirm pending round and learn")
+# ----------------------
+st.subheader("Confirm pending round")
 if st.session_state.pending:
     if st.button("Confirm & Learn"):
         new_round = st.session_state.pending
-        # update priors from new round
-        if len(st.session_state.history) >= 1:
-            prev = st.session_state.history[-1]
-            for p in range(NUM_PLACES):
-                st.session_state.markov_num[p].update(prev['places'][p]['num'], new_round['places'][p]['num'])
-        for p in range(NUM_PLACES):
-            st.session_state.freq_num[p].update(new_round['places'][p]['num'])
-            st.session_state.freq_col[p].update(new_round['places'][p]['color'])
-
-        st.session_state.history.append(new_round)
-        save_history()
-        st.session_state.log.append({
-            'added': round_to_display(new_round),
-            'history_len': len(st.session_state.history)
-        })
+        incremental_update_and_predict(new_round)
         st.session_state.pending = None
-        st.success("Confirmed & learned — priors updated.")
+        st.success("Confirmed & learned — models updated.")
         st.experimental_rerun()
     if st.button("Discard pending"):
         st.session_state.pending = None
         st.info("Pending discarded")
 
-# ------------------------
+# ----------------------
 # History & logs
-# ------------------------
+# ----------------------
 st.markdown("---")
-st.subheader("History (last 200)")
+st.subheader("History")
 if st.session_state.history:
-    df = pd.DataFrame([{'Round': i+1,
-                        'P1': f\"{r['places'][0]['num']}{INV_COLOR[r['places'][0]['color']]}{'B' if r['places'][0].get('size_observed', r['places'][0]['num']>=5) else 'S'}\",
-                        'P2': f\"{r['places'][1]['num']}{INV_COLOR[r['places'][1]['color']]}{'B' if r['places'][1].get('size_observed', r['places'][1]['num']>=5) else 'S'}\",
-                        'P3': f\"{r['places'][2]['num']}{INV_COLOR[r['places'][2]['color']]}{'B' if r['places'][2].get('size_observed', r['places'][2]['num']>=5) else 'S'}\"}
-                       for i,r in enumerate(st.session_state.history)])
+    rows = []
+    for i, r in enumerate(st.session_state.history):
+        rows.append({
+            "Round": i+1,
+            "P1": "{}{}{}".format(r['places'][0]['num'], INV_COLOR[r['places'][0]['color']], 'B' if r['places'][0].get('size_observed', r['places'][0]['num']>=5) else 'S'),
+            "P2": "{}{}{}".format(r['places'][1]['num'], INV_COLOR[r['places'][1]['color']], 'B' if r['places'][1].get('size_observed', r['places'][1]['num']>=5) else 'S'),
+            "P3": "{}{}{}".format(r['places'][2]['num'], INV_COLOR[r['places'][2]['color']], 'B' if r['places'][2].get('size_observed', r['places'][2]['num']>=5) else 'S')
+        })
+    df = pd.DataFrame(rows)
     st.dataframe(df.tail(200))
     buf = BytesIO(); df.to_excel(buf, index=False)
-    st.download_button("⬇️ Download history (Excel)", data=buf.getvalue(), file_name="history_simple.xlsx")
+    st.download_button("⬇️ Download history", data=buf.getvalue(), file_name="history_deep.xlsx")
 
 if st.session_state.log:
     st.subheader("Log")
     st.dataframe(pd.DataFrame(st.session_state.log).tail(200))
     buf2 = BytesIO(); pd.DataFrame(st.session_state.log).to_excel(buf2, index=False)
-    st.download_button("⬇️ Download log (Excel)", data=buf2.getvalue(), file_name="log_simple.xlsx")
+    st.download_button("⬇️ Download log", data=buf2.getvalue(), file_name="log_deep.xlsx")
 
-st.caption("Notes: This is a practical, lightweight online predictor using Markov + frequency + recent pattern. It enforces number->size determinism and handles ambiguous colors (0/5) via color frequency priors.")
+st.caption("Notes: LSTM models trained incrementally. Size predictions are derived from number probabilities to avoid color/size confusion.")
