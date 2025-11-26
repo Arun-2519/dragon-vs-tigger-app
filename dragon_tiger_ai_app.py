@@ -1,11 +1,12 @@
-# lottery7_single_no_violet.py
+# lottery7_single_no_violet_improved.py
 """
-Lottery7 Wingo — Single place app (NO VIOLET)
+Lottery7 Wingo — Single place app (NO VIOLET) — Improved color logic
 Rules:
  - Numbers 0-4 => Small (S); 5-9 => Big (B)
- - Numbers {0,2,4,6,8} => Red (R)
- - Numbers {1,3,5,7,9} => Green (G)
-Single place only. Ensemble: LSTM + Markov + Naive Bayes.
+ - Even numbers (0,2,4,6,8) => Red (R)
+ - Odd numbers (1,3,5,7,9) => Green (G)
+Single place only. Ensemble: LSTM + Markov + Naive Bayes for number prediction.
+Primary color prediction is derived from the highest-probability number (argmax).
 Includes: sound alerts, Excel download, accuracy graph, confidence, betting recommendation.
 """
 
@@ -37,8 +38,8 @@ except Exception:
 # -------------------------
 # Config & constants
 # -------------------------
-st.set_page_config(page_title="Lottery7 (No Violet) — Single Place", layout="centered")
-st.title("🎯 Lottery7 Wingo — Single Place (No Violet)")
+st.set_page_config(page_title="Lottery7 (No Violet) — Improved", layout="centered")
+st.title("🎯 Lottery7 Wingo — Single Place (No Violet) — Improved")
 
 # Files
 HISTORY_FILE = "history_single_no_violet.json"
@@ -133,7 +134,7 @@ def encode_round_num(entry):
     vec = np.zeros(NUM_CLASSES_NUM + 1, dtype=np.float32)
     n = int(entry["num"])
     vec[n] = 1.0
-    vec[-1] = 1.0 if n >= 5 else 0.0  # size bit derived from number (consistent with your rule)
+    vec[-1] = 1.0 if n >= 5 else 0.0  # size bit derived from number
     return vec
 
 def color_from_number_idx(n_idx):
@@ -172,13 +173,14 @@ def train_nb_from_replay():
         st.session_state.nb_trained = True
 
 # -------------------------
-# Prediction ensemble
+# Prediction ensemble (IMPROVED)
 # -------------------------
 def predict_next():
     H = st.session_state.history
     L = len(H)
     num_probs_lstm = np.ones(NUM_CLASSES_NUM) / NUM_CLASSES_NUM
 
+    # LSTM prediction
     if L >= WINDOW:
         inp = np.stack([encode_round_num(r) for r in H[-WINDOW:]], axis=0).reshape(1, WINDOW, -1)
         try:
@@ -186,7 +188,7 @@ def predict_next():
         except Exception:
             num_probs_lstm = np.ones(NUM_CLASSES_NUM) / NUM_CLASSES_NUM
 
-    # Markov (use last observed number)
+    # Markov (last -> next)
     if L >= 1:
         last = int(H[-1]["num"])
         row = st.session_state.markov[last].astype(np.float32)
@@ -194,7 +196,7 @@ def predict_next():
     else:
         markov_probs = np.ones(NUM_CLASSES_NUM) / NUM_CLASSES_NUM
 
-    # Bayes (counts)
+    # Bayes (counts in window)
     if st.session_state.nb_trained and L >= WINDOW:
         window = H[-WINDOW:]
         counts = np.ones(NUM_CLASSES_NUM, dtype=int)
@@ -207,33 +209,53 @@ def predict_next():
     else:
         bayes_probs = np.ones(NUM_CLASSES_NUM) / NUM_CLASSES_NUM
 
+    # Ensemble combine with smoothing to avoid ties
+    eps = 1e-9
     wsum = (W_LSTM + W_MARKOV + W_BAYES)
-    num_probs = (W_LSTM * num_probs_lstm + W_MARKOV * markov_probs + W_BAYES * bayes_probs) / wsum
+    num_probs_raw = (W_LSTM * num_probs_lstm + W_MARKOV * markov_probs + W_BAYES * bayes_probs) / wsum
+    num_probs = num_probs_raw + eps
+    num_probs = num_probs / num_probs.sum()
 
-    # Color derived deterministically from number probs
+    # --- DERIVE COLOR ---
+    # Method A (aggregated): sum odd/even mass
     green_prob = sum([num_probs[i] for i in range(NUM_CLASSES_NUM) if i in ODD_SET])
     red_prob = sum([num_probs[i] for i in range(NUM_CLASSES_NUM) if i in EVEN_SET])
-    color_probs = np.array([green_prob, red_prob], dtype=np.float32)
-    if color_probs.sum() > 0:
-        color_probs = color_probs / color_probs.sum()
-    else:
-        color_probs = np.array([0.5, 0.5])
+    color_probs_agg = np.array([green_prob, red_prob], dtype=np.float32)
+    color_probs_agg = color_probs_agg / (color_probs_agg.sum() + eps)
 
-    # Size deterministically from number probs
+    # Method B (argmax-number): pick most-likely number and deterministically derive color
+    argmax_num = int(np.argmax(num_probs))
+    color_idx_from_argmax = color_from_number_idx(argmax_num)
+
+    # Color confidence (we provide both)
+    # confidence_agg = max fraction for either color (agg)
+    confidence_agg = float(np.max(color_probs_agg) * 100.0)
+    # confidence_argmax = probability of argmax number expressed as percent
+    confidence_argmax = float(np.max(num_probs) * 100.0)
+
+    # Choose primary color recommendation: use argmax-based mapping (more decisive)
+    primary_color_idx = color_idx_from_argmax
+    primary_color_conf = confidence_argmax
+
+    # Size derived deterministically from number_probs (small vs big)
     small_prob = num_probs[:5].sum()
     big_prob = num_probs[5:].sum()
     size_probs = np.array([small_prob, big_prob], dtype=np.float32)
-    if size_probs.sum() > 0:
-        size_probs = size_probs / size_probs.sum()
-    else:
-        size_probs = np.array([0.5, 0.5])
+    size_probs = size_probs / (size_probs.sum() + eps)
 
+    # confidences
     confidences = {
         "Number": float(np.max(num_probs) * 100.0),
-        "Color": float(np.max(color_probs) * 100.0),
+        "Color_agg": confidence_agg,
+        "Color_from_number": confidence_argmax,
         "Size": float(np.max(size_probs) * 100.0)
     }
-    return num_probs, color_probs, size_probs, confidences
+
+    # Also compute top-3 number candidates for display
+    top_indices = np.argsort(-num_probs)[:3]
+    top3 = [(int(i), float(num_probs[i]*100.0)) for i in top_indices]
+
+    return num_probs, {"agg": color_probs_agg, "from_argmax": primary_color_idx}, size_probs, confidences, top3
 
 # -------------------------
 # Accuracy tracking
@@ -254,7 +276,7 @@ def record_confirmation(predictions, actual):
         "col_correct": int(correct_col),
         "size_correct": int(correct_size),
         "conf_num": float(predictions["confidences"]["Number"]),
-        "conf_col": float(predictions["confidences"]["Color"]),
+        "conf_col": float(predictions["confidences"]["Color_from_number"]),
         "conf_size": float(predictions["confidences"]["Size"])
     })
     if correct_num:
@@ -293,7 +315,7 @@ c1, c2, c3 = st.columns([1,1,1])
 with c1:
     size_ui = st.selectbox("Size (S/B)", ["S","B"])
 with c2:
-    color_ui = st.selectbox("Color (for record)", ["G","R"])  # user can still record color, but color is derived from number for model logic
+    color_ui = st.selectbox("Color (for record)", ["G","R"])
 with c3:
     num_ui = st.number_input("Number (0-9)", min_value=0, max_value=9, value=0, step=1)
 
@@ -309,23 +331,37 @@ if st.button("Queue & Add round"):
 st.markdown("---")
 st.subheader("Live prediction & recommendation")
 
-num_probs, col_probs, size_probs, confidences = predict_next()
+num_probs, color_info, size_probs, confidences, top3 = predict_next()
 pred_num = int(np.argmax(num_probs))
-pred_col = int(np.argmax(col_probs))
+pred_col_from_argmax = int(color_info["from_argmax"])  # 0: G, 1: R
+pred_col_agg = int(np.argmax(color_info["agg"]))
 pred_size = int(np.argmax(size_probs))
 
+# Show main metrics
 st.metric("Predicted Number", f"{pred_num}", delta=f"conf {confidences['Number']:.1f}%")
-st.metric("Predicted Color", f"{INV_COLOR[pred_col]}", delta=f"conf {confidences['Color']:.1f}%")
+st.metric("Predicted Color (from top-number)", f"{INV_COLOR[pred_col_from_argmax]}", delta=f"conf {confidences['Color_from_number']:.1f}%")
+st.metric("Predicted Color (aggregated odd/even)", f"{INV_COLOR[pred_col_agg]}", delta=f"conf {confidences['Color_agg']:.1f}%")
 st.metric("Predicted Size", "B" if pred_size==1 else "S", delta=f"conf {confidences['Size']:.1f}%")
 
-# Recommendation: choose best category by confidence
-best_cat = max(confidences.keys(), key=lambda k: confidences[k])
-best_conf = confidences[best_cat]
+# Show top-3 numbers to give more context
+st.write("Top 3 number candidates (number : prob%)")
+for n, p in top3:
+    st.write(f"- {n} : {p:.1f}%")
+
+# Recommendation logic
+# prefer Number bet when its confidence is highest; prefer Color_from_argmax as next
+category_confidences = {
+    "Number": confidences["Number"],
+    "Color_from_number": confidences["Color_from_number"],
+    "Size": confidences["Size"]
+}
+best_cat = max(category_confidences.keys(), key=lambda k: category_confidences[k])
+best_conf = category_confidences[best_cat]
 if best_conf >= CONF_THRESHOLD:
     if best_cat == "Number":
         bet_val = str(pred_num)
-    elif best_cat == "Color":
-        bet_val = INV_COLOR[pred_col]
+    elif best_cat == "Color_from_number":
+        bet_val = INV_COLOR[pred_col_from_argmax]
     else:
         bet_val = "B" if pred_size==1 else "S"
     st.success(f"RECOMMENDED BET → {best_cat}: {bet_val} (confidence {best_conf:.1f}%)")
@@ -377,7 +413,7 @@ if st.button("Confirm & Learn (label)"):
             st.warning("Incremental LSTM training failed this round.")
 
     # record prediction vs actual
-    predictions = {"num": pred_num, "col": pred_col, "size": pred_size, "confidences": confidences}
+    predictions = {"num": pred_num, "col": pred_col_from_argmax, "size": pred_size, "confidences": confidences}
     record_confirmation(predictions, actual_entry)
     st.success("Confirmed & learned — models/prior updated.")
 
@@ -393,14 +429,14 @@ if st.session_state.history:
     st.dataframe(df_hist.tail(100))
     buf = BytesIO()
     df_hist.to_excel(buf, index=False)
-    st.download_button("⬇️ Download history (Excel)", data=buf.getvalue(), file_name="history_no_violet.xlsx")
+    st.download_button("⬇️ Download history (Excel)", data=buf.getvalue(), file_name="history_no_violet_improved.xlsx")
 
 if st.session_state.log:
     df_log = pd.DataFrame(st.session_state.log)
     st.dataframe(df_log.tail(200))
     buf2 = BytesIO()
     df_log.to_excel(buf2, index=False)
-    st.download_button("⬇️ Download prediction log (Excel)", data=buf2.getvalue(), file_name="prediction_log_no_violet.xlsx")
+    st.download_button("⬇️ Download prediction log (Excel)", data=buf2.getvalue(), file_name="prediction_log_no_violet_improved.xlsx")
 
 # Accuracy graph & stats
 st.markdown("---")
@@ -410,4 +446,5 @@ num_conf_avg = np.mean([l["conf_num"] for l in st.session_state.log]) if st.sess
 st.write(f"Average predicted-number confidence (history): {num_conf_avg:.1f}%")
 st.write(f"Loss streak (consecutive incorrect numbers): {st.session_state.loss_streak}")
 
-st.caption("Notes: Violet removed. Color is derived deterministically from number (odd→Green, even→Red). Ensemble = LSTM + Markov + NaiveBayes for number prediction.")
+st.caption("Notes: Primary color = color of the most probable (argmax) number. Aggregated odd/even color mass is shown for diagnostics. Ensemble = LSTM + Markov + NaiveBayes for number prediction.")
+
