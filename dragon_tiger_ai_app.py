@@ -457,32 +457,108 @@ def incremental_update_and_predict(new_round):
     return num_probs, color_final, size_final
 
 # -----------------
-# UI: input flow
+# UI: input flow (UPDATED: accepts Size override & combined color labels)
 # -----------------
 st.subheader("Enter new round (Queue -> Confirm & Learn)")
+
+# Option: if you want to treat observed color as 'truth' for history (else app will derive color from numbers)
+use_observed_color_as_truth = st.checkbox("Use observed color as truth when saving history (else app will derive color from number rules)", value=False)
+
 cols = st.columns(NUM_PLACES)
 place_inputs = []
+COLOR_CHOICES = ['G', 'R', 'V', 'R+V', 'G+V']  # supports combined entries
+SIZE_CHOICES = ['Auto (derived from number)', 'S (Small)', 'B (Big)']
+
 for i in range(NUM_PLACES):
     with cols[i]:
         st.markdown(f"**Place P{i+1}**")
+        # Number input 0..9
         num_val = st.number_input(f"P{i+1} Number", min_value=0, max_value=9, value=0, key=f'num_in_{i}')
-        # allow entering color as actual observed color (0/1/2) for history, but model will enforce rules on prediction
-        col_val = st.selectbox(f"P{i+1} Color (observed)", options=['G','R','V'], index=0, key=f'col_in_{i}')
-        place_inputs.append({'num': int(num_val), 'color': 0 if col_val=='G' else (1 if col_val=='R' else 2)})
+        # Color observed — now supports combined values
+        col_val = st.selectbox(f"P{i+1} Color (observed)", options=COLOR_CHOICES, index=0, key=f'col_in_{i}')
+        # Allow the user to optionally override size (small/big). Default 'Auto' uses number-derived rule.
+        size_override = st.selectbox(f"P{i+1} Size (optional override)", options=SIZE_CHOICES, index=0, key=f'size_in_{i}')
+        place_inputs.append({
+            'num': int(num_val),
+            'color_raw': col_val,         # keep raw label (e.g. 'R+V')
+            'size_raw': size_override    # keep raw size choice
+        })
 
 if st.button('Queue round'):
-    # create pending round with size derived from number
+    # create pending round with internal mapped color & size
+    # mapping rules:
+    #  - If color_raw == 'G' -> color_int = 0
+    #  - 'R' -> 1
+    #  - 'V' -> 2
+    #  - 'R+V' -> ambiguous: store primary as 1 (R) but mark ambiguous_color = 'R+V'
+    #  - 'G+V' -> store primary as 0 (G) but mark ambiguous_color = 'G+V'
+    # size mapping:
+    #  - If user selected 'S' or 'B' override, use that as observed_size (0 or 1).
+    #  - If 'Auto', observed_size is derived from number (0-4 -> S, 5-9 -> B).
     pending_round = {'places': []}
     for p in range(NUM_PLACES):
         n = place_inputs[p]['num']
-        c = place_inputs[p]['color']
-        s = 1 if n >=5 else 0
-        pending_round['places'].append({'num': int(n), 'color': int(c), 'size': int(s)})
+        c_raw = place_inputs[p]['color_raw']
+        s_raw = place_inputs[p]['size_raw']
+
+        # color mapping to integer for storage (model expects an int for color)
+        if c_raw == 'G':
+            c_int = 0
+            ambiguous = None
+        elif c_raw == 'R':
+            c_int = 1
+            ambiguous = None
+        elif c_raw == 'V':
+            c_int = 2
+            ambiguous = None
+        elif c_raw == 'R+V':
+            # mark ambiguous between red and violet
+            # store primary as Red (1) for backwards compatibility, but keep raw label
+            c_int = 1
+            ambiguous = 'R+V'
+        elif c_raw == 'G+V':
+            # store primary as Green (0)
+            c_int = 0
+            ambiguous = 'G+V'
+        else:
+            c_int = 1
+            ambiguous = None
+
+        # size mapping
+        if s_raw == 'S (Small)':
+            s_int = 0
+            size_override_used = True
+        elif s_raw == 'B (Big)':
+            s_int = 1
+            size_override_used = True
+        else:
+            # Auto: derive from number
+            s_int = 1 if n >=5 else 0
+            size_override_used = False
+
+        # If user chose to use observed color as truth, we will keep the observed raw label and store color_int as above.
+        # If NOT, the app may still later derive color from number rules during training/encoding depending on choice.
+        pending_round['places'].append({
+            'num': int(n),
+            'color': int(c_int),           # primary integer used for encoding/training
+            'color_raw': c_raw,            # raw label for audit and ambiguous handling
+            'ambiguous_color': ambiguous,  # None or 'R+V'/'G+V'
+            'size_observed': int(s_int),   # observed/overridden (0 small,1 big)
+            'size_override_used': bool(size_override_used)
+        })
+
     st.session_state.pending = pending_round
     st.success('Queued round — confirm to learn')
 
+# display pending details if any
 if st.session_state.pending:
-    st.info('Pending: ' + ', '.join([f"P{i+1}:{st.session_state.pending['places'][i]['num']}{INV_COLOR[st.session_state.pending['places'][i]['color']]}{'B' if st.session_state.pending['places'][i]['size']==1 else 'S'}" for i in range(NUM_PLACES)]))
+    pending = st.session_state.pending
+    lines = []
+    for i in range(NUM_PLACES):
+        p = pending['places'][i]
+        size_label = 'B' if p['size_observed']==1 else 'S'
+        lines.append(f"P{i+1}:{p['num']}{p['color_raw']}{size_label}")
+    st.info("Pending: " + ", ".join(lines))
 
 # live prediction (before confirming) if enough history
 st.subheader('Live prediction (based on current model & last window)')
