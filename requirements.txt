@@ -1,5 +1,6 @@
 streamlit
 numpy
 pandas
+tensorflow
 openpyxl
 scikit-learn
