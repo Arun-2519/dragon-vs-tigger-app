@@ -1,6 +1,5 @@
 streamlit
+tensorflow
 numpy
 pandas
-scikit-learn
-joblib
-xgboost
+openpyxl
